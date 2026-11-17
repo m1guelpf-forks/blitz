@@ -89,6 +89,7 @@ pub(crate) fn stroke_text<'a>(
         deco_boxes.clear();
         run_records.clear();
         let mut line_has_shadows = false;
+        let decorated_end = decorated_end(&line);
 
         // Pass 1: resolve styles for every glyph run on the line (recording the values
         // needed to paint it) and accumulate decorations. Painting is deferred so text
@@ -180,9 +181,10 @@ pub(crate) fn stroke_text<'a>(
             };
             let run_node_id = style.brush.id;
             let run_x0 = glyph_run.offset() as f64;
-            let run_x1 = run_x0 + glyph_run.advance() as f64;
+            let run_x1 = (run_x0 + glyph_run.advance() as f64).min(decorated_end);
 
-            for entry in stack.iter() {
+            // (A run of only hanging whitespace decorates nothing.)
+            for entry in stack.iter().filter(|_| run_x1 > run_x0) {
                 if entry.decoration.is_none() {
                     continue;
                 }
@@ -244,6 +246,25 @@ pub(crate) fn stroke_text<'a>(
             line.metrics().baseline,
             None,
         );
+    }
+}
+
+/// Where a line's decorations end: before the whitespace that hangs past its end, which
+/// browsers don't paint. Only left-to-right lines are trimmed, where that whitespace is at
+/// the right end.
+fn decorated_end(line: &Line<'_, TextBrush>) -> f64 {
+    let hanging = line.metrics().hanging_advance as f64;
+    let mut end = f64::NEG_INFINITY;
+    for glyph_run in glyph_runs(line) {
+        if glyph_run.run().is_rtl() {
+            return f64::INFINITY;
+        }
+        end = end.max((glyph_run.offset() + glyph_run.advance()) as f64);
+    }
+    if hanging > 0.0 {
+        end - hanging
+    } else {
+        f64::INFINITY
     }
 }
 
