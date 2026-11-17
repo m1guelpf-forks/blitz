@@ -10,6 +10,7 @@ mod filters;
 mod gradient;
 mod kurbo_css;
 mod layers;
+mod pixel_snap;
 mod render;
 mod sizing;
 mod text;

@@ -3,6 +3,7 @@ mod border;
 mod box_shadow;
 mod clip_path;
 mod form_controls;
+mod inline_box;
 mod mask;
 
 use blitz_dom::CopyStyleGetters;
@@ -1026,41 +1027,58 @@ impl ElementCx<'_, '_> {
             let transform =
                 self.transform * Affine::translate((pos.x * self.scale, pos.y * self.scale));
 
-            // Render inline element backgrounds (e.g. `<span style="background: ...">`)
-            // behind the text and selection highlight.
-            crate::text::draw_inline_backgrounds(
-                scene,
-                text_layout.layout.lines(),
+            let layout = self.node.final_layout();
+            let containing_block_width = layout.size.width
+                - (layout.padding.left + layout.padding.right)
+                - (layout.border.left + layout.border.right);
+            let fragments = inline_box::collect_inline_fragments(
                 self.context.dom,
-                transform,
-                self.node.id,
+                text_layout,
+                self.node,
+                containing_block_width,
+                self.scale,
             );
+            let selection_rects = self
+                .context
+                .selection_ranges
+                .get(&self.node.id)
+                .map(|&(start, end)| {
+                    crate::text::text_selection_rects(&text_layout.layout, start, end)
+                })
+                .unwrap_or_default();
 
-            // Render text selection highlight (if any) using cached selection ranges
-            if let Some(&(sel_start, sel_end)) = self.context.selection_ranges.get(&self.node.id) {
-                crate::text::draw_text_selection(
+            // Each line paints the box decorations of its inline elements, then the selection
+            // highlight and the text. A line's decorations thus cover the text of the lines
+            // before it where they overlap, as in browsers.
+            let mut draw_text_context = self.context.draw_text_context.borrow_mut();
+            let mut fragments = fragments.iter().peekable();
+            for (line_index, line) in text_layout.layout.lines().enumerate() {
+                while let Some(fragment) = fragments.next_if(|f| f.line_index == line_index) {
+                    self.draw_inline_fragment(scene, fragment, transform, containing_block_width);
+                }
+                for (rect, _) in selection_rects.iter().filter(|(_, i)| *i == line_index) {
+                    scene.fill(
+                        Fill::NonZero,
+                        transform,
+                        SELECTION_COLOR,
+                        None,
+                        rect,
+                        AntiAliasing::Enabled,
+                    );
+                }
+                crate::text::stroke_text(
                     scene,
-                    &text_layout.layout,
+                    std::iter::once(line),
+                    self.context.dom,
                     transform,
-                    sel_start,
-                    sel_end,
+                    TextPaintOptions {
+                        scale: self.scale,
+                        brush_override: None,
+                    },
+                    self.node.id,
+                    &mut draw_text_context,
                 );
             }
-
-            // Render text
-            let mut draw_text_context = self.context.draw_text_context.borrow_mut();
-            crate::text::stroke_text(
-                scene,
-                text_layout.layout.lines(),
-                self.context.dom,
-                transform,
-                TextPaintOptions {
-                    scale: self.scale,
-                    brush_override: None,
-                },
-                self.node.id,
-                &mut draw_text_context,
-            );
         }
     }
 
