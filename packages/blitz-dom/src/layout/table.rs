@@ -665,11 +665,22 @@ fn collect_table_cells(
                         let len = style.size.width.value();
                         let padding = style.padding.resolve_or_zero(None, resolve_calc_value);
                         let border = style.border.resolve_or_zero(None, resolve_calc_value);
-                        match style.box_sizing {
-                            taffy::BoxSizing::ContentBox => style_helpers::length(
-                                len + padding.left + padding.right + border.left + border.right,
-                            ),
-                            taffy::BoxSizing::BorderBox => style_helpers::length(len),
+                        let width = match style.box_sizing {
+                            taffy::BoxSizing::ContentBox => {
+                                len + padding.left + padding.right + border.left + border.right
+                            }
+                            taffy::BoxSizing::BorderBox => len,
+                        };
+                        if is_fixed {
+                            style_helpers::length(width)
+                        } else {
+                            // In the auto table layout algorithm a cell's width is the
+                            // column's preferred width: the column shrinks below it (down to
+                            // its content's min-content width) to fit the table's width.
+                            style_helpers::minmax(
+                                style_helpers::min_content(),
+                                style_helpers::length(width),
+                            )
                         }
                     }
                     taffy::CompactLength::PERCENT_TAG => {
@@ -836,6 +847,14 @@ impl taffy::LayoutPartialTree for TableTreeWrapper<'_, '_> {
         let cell = &self.ctx.cells[usize::from(node_id)];
         let node_id = crate::taffy_node_id(cell.node_id);
         let mut inputs = inputs;
+        // A cell's specified width is its column's preferred width, not a floor: the cell's
+        // min-content width is that of its content (CSS Tables 3 §3.9.1), so a column can
+        // shrink below the widths of its cells to fit the table's width.
+        if inputs.known_dimensions.width.is_none()
+            && inputs.available_space.width == taffy::AvailableSpace::MinContent
+        {
+            inputs.sizing_mode = taffy::SizingMode::ContentSize;
+        }
         if cell.has_length_height {
             if inputs.known_dimensions.height.is_some() {
                 // Laid out at its row's height, the cell's content still resolves percentage
