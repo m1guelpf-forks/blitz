@@ -14,6 +14,7 @@ use style::values::computed::{
 use style::values::generics::text::{GenericTextDecorationInset, GenericTextDecorationLength};
 
 use crate::color::{Color, ToColorColor as _};
+use crate::pixel_snap::PixelSnap;
 use crate::text::{RunRecord, TextPaintOptions, draw_glyph_run, glyph_run_rect, glyph_runs};
 
 /// Per-font-face cache of the OS/2 `usWinAscent / unitsPerEm` ratio, keyed by the font
@@ -250,29 +251,37 @@ pub(crate) struct LineDecoration {
     pub(crate) first: Option<DecorationRunGeometry>,
 }
 
-/// Resolve the CSS `text-decoration-thickness` to a device-pixel size.
-///
-/// - Percentages are resolved against the font size,
-/// - `from-font` uses the metrics from Parley,
-/// - `auto` uses a thickness of `font-size / 10` (minimum: 1px).
-///
-/// The result is floored to a whole number of device pixels (minimum 1), matching
-/// browsers, which snap decoration thickness to whole pixels.
-fn decoration_size(
+/// Resolve the CSS `text-decoration-thickness` to CSS pixels, as Blink does: `auto` is a tenth
+/// of the font size, `from-font` is the font's own thickness (or `auto` if it has none), and
+/// lengths are rounded to whole pixels. The result is at least 1px.
+fn resolved_thickness(
     thickness: &TextDecorationLength,
     metric_size: f32,
     css_font_size: f64,
     scale: f64,
-) -> f32 {
-    (match thickness {
+) -> f64 {
+    match thickness {
         GenericTextDecorationLength::LengthPercentage(lp) => {
-            lp.resolve(Length::new(css_font_size as f32)).px() as f64 * scale
+            (lp.resolve(Length::new(css_font_size as f32)).px() as f64).round()
         }
-        GenericTextDecorationLength::FromFont => metric_size as f64,
-        GenericTextDecorationLength::Auto => (css_font_size / 10.0).max(1.0) * scale,
-    })
-    .floor()
-    .max(1.0) as f32
+        GenericTextDecorationLength::FromFont if metric_size > 0.0 => metric_size as f64 / scale,
+        GenericTextDecorationLength::FromFont | GenericTextDecorationLength::Auto => {
+            css_font_size / 10.0
+        }
+    }
+    .max(1.0)
+}
+
+/// The device-pixel thickness that a line of the given style and resolved thickness (in CSS
+/// pixels) is painted with. Like Blink, solid and double lines are rounded down to whole CSS
+/// pixels and dotted and dashed ones to the nearest, while wavy lines keep their thickness.
+fn painted_thickness(style: TextDecorationStyle, thickness: f64, scale: f64) -> f32 {
+    let thickness = match style {
+        TextDecorationStyle::Dotted | TextDecorationStyle::Dashed => thickness.round(),
+        TextDecorationStyle::Wavy => thickness,
+        _ => thickness.floor(),
+    };
+    (thickness.max(1.0) * scale) as f32
 }
 
 /// Draws a single decoration line of the given `text-decoration-style` spanning
@@ -504,39 +513,11 @@ pub(crate) fn flush_line_decorations(
             GenericTextDecorationInset::Auto => (0.0, 0.0),
         };
 
-        if deco.line.contains(TextDecorationLine::UNDERLINE) {
-            let size = decoration_size(
-                &deco.thickness,
-                geom.underline_size,
-                geom.css_font_size,
-                scale,
-            );
-
-            // `text-underline-offset` moves the underline away from the text. `auto` keeps
-            // the font's suggested position; otherwise it resolves against the font size
-            // (percentages relative to 1em).
-            let extra_underline_offset = deco
-                .underline_offset
-                .as_ref()
-                .map(|lp| lp.resolve(Length::new(geom.css_font_size as f32)).px() as f64 * scale)
-                .unwrap_or(0.0);
-
-            // `text-underline-position: under` places the underline below the glyph box
-            // (below descenders) rather than at the font's suggested position near the
-            // alphabetic baseline. We anchor the top of the line at the descent so it clears
-            // descending glyphs like "gqy".
-            // An explicit offset under `auto` is taken from the alphabetic
-            // baseline, as CSS and Chrome have it, not from the auto gap.
-            let base_offset = if deco.underline_under {
-                -geom.descent
-            } else if deco.underline_offset.is_some() && !deco.underline_from_font {
-                0.0
-            } else {
-                geom.underline_offset
-            };
-            let offset = base_offset - extra_underline_offset as f32;
-
-            // A `double` underline extends downward, away from the text.
+        // Lines are positioned by their top edge, and drawn from their centre
+        let baseline = geom.baseline as f64;
+        let snap = PixelSnap::new(transform, scale);
+        let mut draw_line = |top: f64, size: f32, double_dir: f64| {
+            let top = snap.y(top);
             draw_decoration_line(
                 scene,
                 transform,
@@ -544,14 +525,48 @@ pub(crate) fn flush_line_decorations(
                 acc.min_x,
                 width,
                 geom.baseline,
-                offset,
+                (baseline - top) as f32,
                 size,
                 &brush,
-                1.0,
+                double_dir,
                 deco.style,
                 inset_start,
                 inset_end,
             );
+        };
+
+        if deco.line.contains(TextDecorationLine::UNDERLINE) {
+            let thickness = resolved_thickness(
+                &deco.thickness,
+                geom.underline_size,
+                geom.css_font_size,
+                scale,
+            );
+
+            // `text-underline-offset` moves the underline away from the text, resolving
+            // against the font size (percentages relative to 1em).
+            let underline_offset = deco
+                .underline_offset
+                .as_ref()
+                .map(|lp| lp.resolve(Length::new(geom.css_font_size as f32)).px() as f64);
+
+            // `text-underline-position: under` places the underline below the glyph box
+            // (below descenders), anchoring its top at the descent so it clears descending
+            // glyphs like "gqy". `from-font` uses the font's suggested position. Otherwise, as
+            // in Blink, the underline is just below the alphabetic baseline: an `auto` offset
+            // leaves a gap of half its thickness, and an explicit one is taken from the
+            // baseline.
+            let top = if deco.underline_under {
+                baseline + geom.descent as f64 + underline_offset.unwrap_or(0.0) * scale
+            } else if deco.underline_from_font {
+                baseline - geom.underline_offset as f64 + underline_offset.unwrap_or(0.0) * scale
+            } else {
+                let gap = underline_offset.map_or((thickness / 2.0).ceil().max(1.0), f64::round);
+                baseline + gap * scale
+            };
+
+            // A `double` underline extends downward, away from the text.
+            draw_line(top, painted_thickness(deco.style, thickness, scale), 1.0);
         }
         if deco.line.contains(TextDecorationLine::OVERLINE) {
             // Fonts don't provide a dedicated overline metric, so reuse the underline
@@ -562,35 +577,21 @@ pub(crate) fn flush_line_decorations(
             // hhea-based ascent Parley reports; using the smaller value would draw the
             // overline too low. Fall back to Parley's ascent for fonts without a usable
             // OS/2 table.
-            let size = decoration_size(
+            let thickness = resolved_thickness(
                 &deco.thickness,
                 geom.underline_size,
                 geom.css_font_size,
                 scale,
             );
+            let size = painted_thickness(deco.style, thickness, scale);
             let ascent =
                 win_ascent(win_ascent_ratios, &geom.font, geom.font_size).unwrap_or(geom.ascent);
-            let offset = ascent + size;
 
             // A `double` overline extends upward, away from the text.
-            draw_decoration_line(
-                scene,
-                transform,
-                scale,
-                acc.min_x,
-                width,
-                geom.baseline,
-                offset,
-                size,
-                &brush,
-                -1.0,
-                deco.style,
-                inset_start,
-                inset_end,
-            );
+            draw_line(baseline - ascent as f64 - size as f64, size, -1.0);
         }
         if deco.line.contains(TextDecorationLine::LINE_THROUGH) {
-            let size = decoration_size(
+            let thickness = resolved_thickness(
                 &deco.thickness,
                 geom.strikethrough_size,
                 geom.css_font_size,
@@ -603,23 +604,8 @@ pub(crate) fn flush_line_decorations(
             // draw the line too close to the baseline.
             let ascent =
                 win_ascent(win_ascent_ratios, &geom.font, geom.font_size).unwrap_or(geom.ascent);
-            let offset = ascent / 3.0 + size / 2.0;
-
-            draw_decoration_line(
-                scene,
-                transform,
-                scale,
-                acc.min_x,
-                width,
-                geom.baseline,
-                offset,
-                size,
-                &brush,
-                1.0,
-                deco.style,
-                inset_start,
-                inset_end,
-            );
+            let top = baseline - ascent as f64 / 3.0 - thickness * scale / 2.0;
+            draw_line(top, painted_thickness(deco.style, thickness, scale), 1.0);
         }
         if clip.is_some() {
             scene.pop_layer();
