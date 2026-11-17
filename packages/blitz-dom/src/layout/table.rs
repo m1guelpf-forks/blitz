@@ -92,7 +92,8 @@ struct ColumnCursor {
     col: u16,
     /// The total number of columns seen so far
     num_columns: u16,
-    /// For each column, the number of further rows it is occupied by a rowspan cell
+    /// For each column, the number of rows (from the last one started) a rowspan cell occupies
+    /// it for
     rowspans: Vec<u16>,
 }
 
@@ -118,7 +119,7 @@ impl ColumnCursor {
             self.rowspans.resize(end as usize, 0);
         }
         for remaining in &mut self.rowspans[self.col as usize..end as usize] {
-            *remaining = rowspan - 1;
+            *remaining = rowspan;
         }
         self.col = end;
         self.num_columns = self.num_columns.max(end);
