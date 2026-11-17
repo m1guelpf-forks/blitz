@@ -550,7 +550,7 @@ impl ElementCx<'_, '_> {
 
         let BackgroundRepeat(repeat_x, repeat_y) = layer.repeat;
 
-        let x = raster_axis_tiling(
+        let (x, x_extend) = raster_axis_tiling(
             *repeat_x,
             origin_rect.x0,
             origin_rect.width(),
@@ -559,7 +559,7 @@ impl ElementCx<'_, '_> {
             image_width,
             x_ratio,
         );
-        let y = raster_axis_tiling(
+        let (y, y_extend) = raster_axis_tiling(
             *repeat_y,
             origin_rect.y0,
             origin_rect.height(),
@@ -587,7 +587,10 @@ impl ElementCx<'_, '_> {
                 scene.fill(
                     peniko::Fill::NonZero,
                     transform,
-                    to_peniko_image(image_data, quality).as_ref(),
+                    to_peniko_image(image_data, quality)
+                        .with_x_extend(x_extend)
+                        .with_y_extend(y_extend)
+                        .as_ref(),
                     None,
                     &tile_rect,
                     AntiAliasing::Enabled,
@@ -894,10 +897,12 @@ struct AxisTiling {
     stride: f64,
 }
 
-/// Per-axis placement and tiling for a raster image layer. `Repeat`/`Round`
-/// produce a single fill covering the whole positioning area (relying on the
-/// image brush repeating), while `Space` produces `count` explicit tiles
-/// spaced `stride` apart.
+/// Per-axis placement and tiling for a raster image layer, and how the image
+/// brush extends along the axis. `Repeat`/`Round` produce a single fill covering
+/// the whole positioning area (relying on the image brush repeating), while
+/// `Space` produces `count` explicit tiles spaced `stride` apart. Tiles that
+/// aren't repeated by the brush (explicit tiles, and a lone tile that covers the
+/// area) clamp at their edges, so filtering doesn't blend in the opposite edge.
 ///
 /// The fill rect is in image pixel coordinates (the drawing transform is
 /// pre-scaled by `ratio`), while translations are in device pixels.
@@ -909,34 +914,44 @@ fn raster_axis_tiling(
     tile_len: f64,
     image_len: f64,
     ratio: f64,
-) -> AxisTiling {
+) -> (AxisTiling, peniko::Extend) {
     use BackgroundRepeatKeyword::*;
 
     match repeat {
         Repeat | Round => {
             let extend_len = extend(bg_pos, tile_len);
-            AxisTiling {
+            let len = origin_len + extend_len;
+            let tiling = AxisTiling {
                 translate: origin_start - extend_len,
-                rect_len: (origin_len + extend_len) / ratio,
+                rect_len: len / ratio,
                 count: 1,
                 stride: 0.0,
+            };
+            if len > tile_len {
+                (tiling, peniko::Extend::Repeat)
+            } else {
+                (tiling, peniko::Extend::Pad)
             }
         }
         Space => {
             let (count, stride) = compute_space_count_and_stride(origin_len, tile_len);
-            AxisTiling {
+            let tiling = AxisTiling {
                 translate: origin_start + if count == 1 { bg_pos } else { 0.0 },
                 rect_len: image_len,
                 count,
                 stride,
-            }
+            };
+            (tiling, peniko::Extend::Pad)
         }
-        NoRepeat => AxisTiling {
-            translate: origin_start + bg_pos,
-            rect_len: image_len,
-            count: 1,
-            stride: 0.0,
-        },
+        NoRepeat => {
+            let tiling = AxisTiling {
+                translate: origin_start + bg_pos,
+                rect_len: image_len,
+                count: 1,
+                stride: 0.0,
+            };
+            (tiling, peniko::Extend::Pad)
+        }
     }
 }
 

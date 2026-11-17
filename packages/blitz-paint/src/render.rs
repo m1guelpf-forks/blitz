@@ -849,7 +849,8 @@ fn svg_viewport_affine(svg: &blitz_dom::node::SvgImageData, width: f32, height: 
     Affine::new([t.sx, t.ky, t.kx, t.sy, t.tx, t.ty].map(f64::from))
 }
 
-/// Ensure that the `resized_image` field has a correctly sized image
+/// An image brush that clamps at the image's edges (`Extend::Pad`), so filtering near an edge
+/// doesn't blend in the opposite edge's pixels. Repeating backgrounds set `Extend::Repeat`.
 fn to_peniko_image(image: &RasterImageData, quality: peniko::ImageQuality) -> peniko::ImageBrush {
     peniko::ImageBrush {
         image: ImageData {
@@ -860,8 +861,8 @@ fn to_peniko_image(image: &RasterImageData, quality: peniko::ImageQuality) -> pe
             alpha_type: peniko::ImageAlphaType::Alpha,
         },
         sampler: ImageSampler {
-            x_extend: peniko::Extend::Repeat,
-            y_extend: peniko::Extend::Repeat,
+            x_extend: peniko::Extend::Pad,
+            y_extend: peniko::Extend::Pad,
             quality,
             alpha: 1.0,
         },
