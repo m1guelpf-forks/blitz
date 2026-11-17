@@ -29,7 +29,9 @@ use crate::{
 };
 
 use super::{
-    damage::ALL_DAMAGE, list::collect_list_item_children, replaced::is_inline_box_element,
+    damage::ALL_DAMAGE,
+    list::collect_list_item_children,
+    replaced::{is_inline_box_element, is_replaced_element},
     table::build_table_context,
 };
 
@@ -64,6 +66,9 @@ pub(crate) enum ConstructionTaskResultData {
 pub(crate) struct LayoutChildren {
     pub(crate) children: ThinVec<NodeId>,
     pub(crate) anonymous_block_id: Option<NodeId>,
+    /// The currently-open anonymous table that consecutive misparented table
+    /// boxes (rows, cells, row groups...) are being appended to.
+    pub(crate) anonymous_table_id: Option<NodeId>,
     /// All anonymous blocks created while collecting these layout children.
     ///
     /// These are recorded on the container node so they can be deallocated the
@@ -85,6 +90,8 @@ impl LayoutChildren {
     }
 
     fn maybe_push_anon_block(&mut self, doc: &mut BaseDocument) {
+        self.anonymous_table_id = None;
+
         fn block_is_only_whitespace(doc: &BaseDocument, node_id: NodeId) -> bool {
             for child_id in doc.nodes[node_id].children.iter().copied() {
                 let child = &doc.nodes[child_id];
@@ -118,6 +125,7 @@ impl LayoutChildren {
         child_id: NodeId,
         doc: &mut BaseDocument,
     ) {
+        self.anonymous_table_id = None;
         if self.anonymous_block_id.is_none() {
             self.create_anonymous_block(container_node_id, doc);
         }
@@ -127,55 +135,111 @@ impl LayoutChildren {
     }
 
     fn create_anonymous_block(&mut self, container_node_id: NodeId, doc: &mut BaseDocument) {
-        use style::selector_parser::PseudoElement;
-
-        const NAME: QualName = QualName {
-            prefix: None,
-            ns: ns!(html),
-            local: local_name!("div"),
-        };
-        let node_id = doc.create_node(NodeData::AnonymousBlock(Box::new(ElementData::new(
-            NAME,
-            Vec::new(),
-        ))));
-
-        // Set style data
-        let parent_style = doc.nodes[container_node_id].primary_styles().unwrap();
-        let read_guard = doc.guard.read();
-        let guards = StylesheetGuards::same(&read_guard);
-        let style = doc.stylist.style_for_anonymous::<BlitzNode>(
-            &guards,
-            &PseudoElement::ServoAnonymousBox,
-            &parent_style,
-        );
-        let mut stylo_element_data = StyloElementData {
-            damage: ALL_DAMAGE,
-            ..Default::default()
-        };
-        drop(parent_style);
-
-        stylo_element_data.styles.primary = Some(style);
-        stylo_element_data.set_restyled();
-
-        *doc.nodes[node_id]
-            .stylo_element_data_mut()
-            .ensure_init_mut() = stylo_element_data;
-
-        if doc.nodes[container_node_id]
-            .flags
-            .contains(NodeFlags::IS_IN_DOCUMENT)
-        {
-            doc.nodes[node_id].flags.insert(NodeFlags::IS_IN_DOCUMENT);
-        }
-        doc.nodes[node_id].parent = Some(container_node_id);
-        doc.nodes[node_id]
-            .layout_parent
-            .set(Some(container_node_id));
-
+        let node_id = create_anonymous_box(doc, container_node_id, AnonymousBox::Block);
         self.children.push(node_id);
         self.anonymous_block_id = Some(node_id);
         self.anonymous_blocks.push(node_id);
     }
+
+    /// Append a misparented table box (a row, cell, row group...) to the
+    /// currently-open anonymous table, creating one if there isn't one
+    /// (CSS 2.1 §17.2.1).
+    fn push_table_wrapped(
+        &mut self,
+        container_node_id: NodeId,
+        child_id: NodeId,
+        doc: &mut BaseDocument,
+    ) {
+        if self.anonymous_table_id.is_none() {
+            self.maybe_push_anon_block(doc);
+            let node_id = create_anonymous_box(doc, container_node_id, AnonymousBox::Table);
+            self.children.push(node_id);
+            self.anonymous_blocks.push(node_id);
+            self.anonymous_table_id = Some(node_id);
+        }
+        doc.nodes[self.anonymous_table_id.unwrap()]
+            .children
+            .push(child_id);
+    }
+}
+
+/// The kinds of anonymous box that construction generates.
+#[derive(Clone, Copy)]
+pub(crate) enum AnonymousBox {
+    /// A block wrapping inline content among block-level siblings.
+    Block,
+    /// A table, row or cell wrapping misparented table content (CSS 2.1 §17.2.1).
+    Table,
+    TableRow,
+    TableCell,
+}
+
+/// Create an anonymous box whose style inherits from `parent_id`'s. Its parent
+/// is `parent_id`, which should own it (list it in its `anonymous_blocks`).
+pub(crate) fn create_anonymous_box(
+    doc: &mut BaseDocument,
+    parent_id: NodeId,
+    kind: AnonymousBox,
+) -> NodeId {
+    use style::selector_parser::PseudoElement;
+
+    const NAME: QualName = QualName {
+        prefix: None,
+        ns: ns!(html),
+        local: local_name!("div"),
+    };
+    let node_id = doc.create_node(NodeData::AnonymousBlock(Box::new(ElementData::new(
+        NAME,
+        Vec::new(),
+    ))));
+
+    // Set style data
+    let pseudo = match kind {
+        AnonymousBox::Block => PseudoElement::ServoAnonymousBox,
+        AnonymousBox::Table => PseudoElement::ServoAnonymousTable,
+        AnonymousBox::TableRow => PseudoElement::ServoAnonymousTableRow,
+        AnonymousBox::TableCell => PseudoElement::ServoAnonymousTableCell,
+    };
+    let parent_style = doc.nodes[parent_id].primary_styles().unwrap();
+    let read_guard = doc.guard.read();
+    let guards = StylesheetGuards::same(&read_guard);
+    let style = doc
+        .stylist
+        .style_for_anonymous::<BlitzNode>(&guards, &pseudo, &parent_style);
+    let mut stylo_element_data = StyloElementData {
+        damage: ALL_DAMAGE,
+        ..Default::default()
+    };
+    drop(parent_style);
+
+    stylo_element_data.styles.primary = Some(style);
+    stylo_element_data.set_restyled();
+
+    *doc.nodes[node_id]
+        .stylo_element_data_mut()
+        .ensure_init_mut() = stylo_element_data;
+
+    if doc.nodes[parent_id]
+        .flags
+        .contains(NodeFlags::IS_IN_DOCUMENT)
+    {
+        doc.nodes[node_id].flags.insert(NodeFlags::IS_IN_DOCUMENT);
+    }
+    doc.nodes[node_id].parent = Some(parent_id);
+    doc.nodes[node_id].layout_parent.set(Some(parent_id));
+    node_id
+}
+
+/// Whether a box belongs inside a table (a row group, row, cell, column or
+/// column group), so needs an anonymous table around it anywhere else.
+/// Captions are left alone: tables don't lay them out yet. A replaced element
+/// is never a table box (CSS Display 3 §2.4).
+fn is_internal_table_box(node: &Node) -> bool {
+    node.display_style()
+        .is_some_and(|display| display.outside() == DisplayOutside::InternalTable)
+        && !node
+            .element_data()
+            .is_some_and(|element| is_replaced_element(&element.name.local))
 }
 
 fn push_children_and_pseudos(layout_children: &mut ThinVec<NodeId>, node: &Node) {
@@ -292,6 +356,8 @@ struct FlowClassification {
     has_contents: bool,
     /// An in-flow inline-level child that is laid out in an anonymous block (text, or an inline box without block content).
     has_inline_level: bool,
+    /// An in-flow table-internal child (a row, cell...), which is laid out in an anonymous table.
+    has_table_internal: bool,
 }
 
 impl Default for FlowClassification {
@@ -302,6 +368,7 @@ impl Default for FlowClassification {
             all_out_of_flow: true,
             has_contents: false,
             has_inline_level: false,
+            has_table_internal: false,
         }
     }
 }
@@ -373,6 +440,7 @@ fn classify_flow_children(
             }
 
             classification.all_out_of_flow = false;
+            classification.has_table_internal |= is_internal_table_box(child);
             match display.outside() {
                 DisplayOutside::None => {}
                 DisplayOutside::Block
@@ -533,7 +601,9 @@ fn collect_layout_children_with_wrap(
                 .any(|child| {
                     let display = child.display_style().unwrap_or(Display::inline());
                     let node_kind = child.data.kind();
-                    display.inside() == DisplayInside::Contents || node_kind == NodeKind::Text
+                    display.inside() == DisplayInside::Contents
+                        || node_kind == NodeKind::Text
+                        || is_internal_table_box(child)
                 });
 
             if !has_text_node_or_contents {
@@ -556,7 +626,8 @@ fn collect_layout_children_with_wrap(
         }
 
         DisplayInside::Table => {
-            let (table_context, tlayout_children) = build_table_context(doc, container_node_id);
+            let (table_context, tlayout_children) =
+                build_table_context(doc, container_node_id, &mut out.anonymous_blocks);
             #[allow(clippy::arc_with_non_send_sync)]
             let data = SpecialElementData::TableRoot(Arc::new(table_context));
             doc.nodes[container_node_id]
@@ -634,7 +705,10 @@ fn collect_layout_children_with_wrap(
 
             // If the children are either all inline or all block then simply return the regular children
             // as the layout children
-            if classification.all_block & !classification.has_contents {
+            if classification.all_block
+                & !classification.has_contents
+                & !classification.has_table_internal
+            {
                 return push_non_whitespace_children_and_pseudos(
                     &mut out.children,
                     &doc.nodes[container_node_id],
@@ -841,6 +915,17 @@ fn collect_complex_layout_children(
                 needs_wrap,
             });
             collect_layout_children_with_wrap(doc, child_id, out, wrap)
+        }
+        // Misparented table boxes go into the current anonymous table (or a new
+        // one), and white space between them generates no box.
+        else if child_node_kind == NodeKind::Element
+            && is_internal_table_box(&doc.nodes[child_id])
+        {
+            out.push_table_wrapped(container_node_id, child_id, doc);
+        } else if out.anonymous_table_id.is_some()
+            && doc.nodes[child_id].is_collapsible_whitespace_node()
+        {
+            // Dropped, so the anonymous table stays open for the next table box
         }
         // Push nodes that need wrapping into the current "anonymous block container".
         // If there is not an open one then we create one.

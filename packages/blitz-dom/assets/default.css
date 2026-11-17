@@ -394,6 +394,20 @@ plaintext {
 
 /* tables */
 
+/* The anonymous table boxes that wrap misparented table content (CSS 2.1 §17.2.1): they
+   inherit inherited properties and take the initial value of every other one. */
+*|*::-servo-anonymous-table {
+    display: table;
+}
+
+*|*::-servo-anonymous-table-row {
+    display: table-row;
+}
+
+*|*::-servo-anonymous-table-cell {
+    display: table-cell;
+}
+
 table {
     display: table;
     border-spacing: 2px;

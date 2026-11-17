@@ -15,6 +15,7 @@ use style::matching::StyleChange;
 use style::properties::ComputedValues;
 use style::properties::generated::longhands::position::computed_value::T as Position;
 use style::selector_parser::{PseudoElement, RestyleDamage};
+use style::servo_arc::Arc as ServoArc;
 use style::shared_lock::StylesheetGuards;
 use style::url::ComputedUrl;
 use style::values::generics::image::Image as StyloImage;
@@ -204,19 +205,12 @@ impl BaseDocument {
             return RestyleDamage::empty();
         }
 
-        // Cascade once from the owner, sharing the result across its anonymous boxes.
-        let style = {
-            let Some(parent_style) = self.nodes[node_id].primary_styles() else {
-                return RestyleDamage::empty();
-            };
-            let read_guard = self.guard.read();
-            let guards = StylesheetGuards::same(&read_guard);
-            self.stylist.style_for_anonymous::<BlitzNode>(
-                &guards,
-                &PseudoElement::ServoAnonymousBox,
-                &parent_style,
-            )
+        // Cascade once from the owner per kind of anonymous box (block, table, table row or
+        // table cell), sharing the result across its boxes of that kind.
+        let Some(parent_style) = self.nodes[node_id].primary_styles().map(|s| s.clone()) else {
+            return RestyleDamage::empty();
         };
+        let mut styles: Vec<(PseudoElement, ServoArc<ComputedValues>)> = Vec::new();
 
         // Take the ownership list so we can mutate nodes without copying it.
         let anonymous_blocks = std::mem::take(&mut self.nodes[node_id].anonymous_blocks);
@@ -234,12 +228,29 @@ impl BaseDocument {
                 let Some(old_style) = data.styles.primary.as_ref() else {
                     continue;
                 };
+                let pseudo = old_style
+                    .pseudo()
+                    .unwrap_or(PseudoElement::ServoAnonymousBox);
+                let style = match styles.iter().find(|(kind, _)| *kind == pseudo) {
+                    Some((_, style)) => style.clone(),
+                    None => {
+                        let read_guard = self.guard.read();
+                        let guards = StylesheetGuards::same(&read_guard);
+                        let style = self.stylist.style_for_anonymous::<BlitzNode>(
+                            &guards,
+                            &pseudo,
+                            &parent_style,
+                        );
+                        styles.push((pseudo, style.clone()));
+                        style
+                    }
+                };
 
                 // Compute precise damage, retaining the old style allocation if unchanged.
                 let diff = RestyleDamage::compute_style_difference::<BlitzNode>(old_style, &style);
                 let changed = matches!(diff.change, StyleChange::Changed { .. });
                 if changed {
-                    data.styles.primary = Some(style.clone());
+                    data.styles.primary = Some(style);
                     data.set_restyled();
                 }
                 (data.damage | diff.damage, changed)
@@ -455,7 +466,9 @@ pub(crate) fn compute_layout_damage(old: &ComputedValues, new: &ComputedValues) 
                 | DisplayInside::TableCell
         ) && (old.get_position() != new.get_position()
             || old.get_padding() != new.get_padding()
-            || old.get_border() != new.get_border())
+            || old.get_border() != new.get_border()
+            || old.get_table() != new.get_table()
+            || old.get_inherited_table() != new.get_inherited_table())
     };
 
     #[allow(
