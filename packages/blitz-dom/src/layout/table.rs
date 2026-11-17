@@ -69,6 +69,9 @@ pub struct TableCell {
     pub row: u16,
     /// Index of the column the cell originates in
     pub column: u16,
+    /// Whether the cell has a length `height`, which is only a minimum (see
+    /// `compute_child_layout`)
+    has_length_height: bool,
     style: taffy::Style<Atom>,
 }
 
@@ -725,12 +728,24 @@ fn collect_table_cells(
                     row.is_constrained = true;
                 }
             }
+            // A cell's height is a minimum: the cell (and its rows with it) grows to fit its
+            // content rather than letting it overflow into the next row.
+            let has_length_height = style.size.height.tag() == taffy::CompactLength::LENGTH_TAG;
+            if has_length_height {
+                let height = style.size.height.value();
+                let min = style.min_size.height.into_raw();
+                if min.tag() != taffy::CompactLength::LENGTH_TAG || min.value() < height {
+                    style.min_size.height = style_helpers::length(height);
+                }
+                style.size.height = style_helpers::auto();
+            }
 
             style.size.width = style_helpers::auto();
             cells.push(TableCell {
                 node_id,
                 row: row.saturating_sub(1),
                 column: col,
+                has_length_height,
                 style,
             });
 
@@ -820,6 +835,29 @@ impl taffy::LayoutPartialTree for TableTreeWrapper<'_, '_> {
     ) -> taffy::LayoutOutput {
         let cell = &self.ctx.cells[usize::from(node_id)];
         let node_id = crate::taffy_node_id(cell.node_id);
+        let mut inputs = inputs;
+        if cell.has_length_height {
+            if inputs.known_dimensions.height.is_some() {
+                // Laid out at its row's height, the cell's content still resolves percentage
+                // heights against the cell's own height, as in browsers
+                inputs.known_dimensions_are_definite.height = false;
+            } else if inputs.axis != taffy::RequestedAxis::Horizontal {
+                // The cell's height is a minimum: it's as tall as its content when that's taller
+                let specified = self.doc.compute_child_layout(node_id, inputs);
+                let content = self.doc.compute_child_layout(
+                    node_id,
+                    taffy::tree::LayoutInput {
+                        sizing_mode: taffy::SizingMode::ContentSize,
+                        ..inputs
+                    },
+                );
+                return if content.size.height > specified.size.height {
+                    content
+                } else {
+                    specified
+                };
+            }
+        }
         self.doc.compute_child_layout(node_id, inputs)
     }
 }
