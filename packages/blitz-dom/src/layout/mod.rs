@@ -535,7 +535,14 @@ impl LayoutPassState<'_> {
                     let mut table_wrapper = TableTreeWrapper {
                         doc: self,
                         ctx: context,
+                        style: None,
                     };
+                    if let Some(width) = table_wrapper.size_columns(inputs) {
+                        return taffy::LayoutOutput::from_outer_size(taffy::Size {
+                            width,
+                            height: 0.0,
+                        });
+                    }
                     let mut output = compute_grid_layout(&mut table_wrapper, node_id, inputs);
 
                     // Absolutely positioned children take no part in the table grid. Their
