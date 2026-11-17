@@ -100,6 +100,9 @@ pub(crate) struct DecorationStackEntry {
     pub(crate) fill_color: Color,
     /// The decoration this node introduces as a decorating box, if any.
     pub(crate) decoration: Option<ResolvedDecoration>,
+    /// Whether this node is a non-atomic inline element with an `opacity` below 1, which is
+    /// painted as a group of its own (see [`crate::text::RunFilter`]).
+    pub(crate) is_opacity_group: bool,
     /// This node's (inherited) `text-shadow` list, or `None` for `text-shadow: none`.
     /// Shared (via `Arc`) with the per-run records and decorating boxes so that
     /// consecutive runs with the same shadow can be batched by pointer equality.
@@ -128,14 +131,18 @@ pub(crate) fn resolve_decoration_entry(
     parent: Option<&DecorationStackEntry>,
     scale: f64,
 ) -> DecorationStackEntry {
-    let Some(styles) = doc.get_node(node_id).and_then(|node| node.primary_styles()) else {
+    let node = doc.get_node(node_id);
+    let Some(styles) = node.and_then(|node| node.primary_styles()) else {
         return DecorationStackEntry {
             node_id,
             fill_color: Color::BLACK,
             decoration: None,
+            is_opacity_group: false,
             text_shadows: None,
         };
     };
+    let is_opacity_group =
+        styles.get_effects().opacity < 1.0 && node.is_some_and(|node| node.is_non_atomic_inline());
 
     let itext = styles.get_inherited_text();
     let text = styles.get_text();
@@ -211,6 +218,7 @@ pub(crate) fn resolve_decoration_entry(
         node_id,
         fill_color,
         decoration,
+        is_opacity_group,
         text_shadows,
     }
 }
@@ -452,6 +460,7 @@ pub(crate) fn flush_line_decorations(
     let TextPaintOptions {
         scale,
         brush_override,
+        ..
     } = options;
     let (transform, brush_override) = match shadow {
         Some((shadow, _)) => (

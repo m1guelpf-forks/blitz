@@ -6,16 +6,20 @@
 //! paints its part of a "strip", the element's box with its fragments laid end to end, so that
 //! its inline-start edge is on its first fragment, its inline-end edge on its last, and
 //! backgrounds continue from one fragment to the next.
+//!
+//! An inline element with an `opacity` below 1 is painted as a group of its own, after the rest
+//! of its inline formatting context: its fragments, its text and the atomic inlines in it are
+//! composited together.
 
 use std::collections::HashMap;
 
-use anyrender::PaintScene;
+use anyrender::{AntiAliasing, PaintScene};
 use blitz_dom::CopyStyleGetters as _;
 use blitz_dom::node::{InlineBoxRef, InlineEdge, TextBrush, TextLayout};
 use blitz_dom::{BaseDocument, Node, NodeId};
 use kurbo::{Affine, Rect};
 use parley::{InlineBoxKind, Line, PositionedLayoutItem};
-use peniko::BlendMode;
+use peniko::{BlendMode, Fill};
 use style::computed_values::direction::T as Direction;
 use style::computed_values::visibility::T as Visibility;
 use style::computed_values::white_space_collapse::T as WhiteSpaceCollapse;
@@ -23,15 +27,19 @@ use style::properties::ComputedValues;
 use style::values::generics::image::GenericImage;
 
 use super::BlitzDomPainter;
+use crate::SELECTION_COLOR;
 use crate::color::{Color, ToColorColor as _};
 use crate::pixel_snap::PixelSnap;
+use crate::text::{RunFilter, TextPaintOptions};
 
 /// The line box fragment of a non-atomic inline element with box decorations.
 ///
 /// Coordinates are in the layout units of the text layout (device pixels).
 pub(crate) struct InlineFragment {
     node_id: NodeId,
-    pub(crate) line_index: usize,
+    line_index: usize,
+    /// The opacity group the fragment is painted in, if any.
+    group: Option<NodeId>,
     is_ltr: bool,
     /// The left and right edges of the fragment's border box.
     x0: f64,
@@ -56,9 +64,36 @@ struct ContentArea {
     descent: f64,
 }
 
+/// The inline content of an inline root, as painted by [`BlitzDomPainter::draw_inline_content`].
+struct InlineLines<'a> {
+    inline_root: &'a Node,
+    text_layout: &'a TextLayout,
+    /// Maps the text layout's coordinates to the scene.
+    transform: Affine,
+    /// The inline size of the inline root's content box, in CSS pixels.
+    containing_block_width: f32,
+    boxes: &'a InlineBoxes,
+}
+
+/// A non-atomic inline element with an `opacity` below 1, which is painted as a group.
+pub(crate) struct OpacityGroup {
+    node_id: NodeId,
+    /// The group it's nested in, if any.
+    parent: Option<NodeId>,
+    opacity: f32,
+}
+
+/// The fragments and opacity groups of the inline elements of a text layout.
+pub(crate) struct InlineBoxes {
+    fragments: Vec<InlineFragment>,
+    groups: Vec<OpacityGroup>,
+}
+
 /// An inline element on the path from the inline root to the current item of a line.
 struct PathEntry {
     node_id: NodeId,
+    /// The innermost opacity group the element is in (itself included).
+    group: Option<NodeId>,
     /// The element's left and right margins (which its edge boxes include) and direction, if it
     /// has box decorations.
     decorated: Option<(f64, f64, bool)>,
@@ -67,23 +102,25 @@ struct PathEntry {
 }
 
 /// Collects the fragments of the inline elements with box decorations in a text layout, in the
-/// order they paint in: line by line, and in tree order within a line.
+/// order they paint in: line by line, and in tree order within a line. Also collects the
+/// opacity groups, outermost first.
 ///
 /// `containing_block_width` (in CSS pixels) is the inline size of the inline root's content box,
 /// which percentage margins resolve against.
-pub(crate) fn collect_inline_fragments(
+fn collect_inline_fragments(
     doc: &BaseDocument,
     text_layout: &TextLayout,
     inline_root: &Node,
     containing_block_width: f32,
     scale: f64,
-) -> Vec<InlineFragment> {
+) -> InlineBoxes {
     // The inline elements of an anonymous inline root are descendants of its parent
     let root_parent = inline_root
         .is_anonymous()
         .then_some(inline_root.parent)
         .flatten();
     let mut fragments = Vec::new();
+    let mut groups: Vec<OpacityGroup> = Vec::new();
     let mut stack: Vec<PathEntry> = Vec::new();
     let mut path = Vec::new();
 
@@ -162,24 +199,42 @@ pub(crate) fn collect_inline_fragments(
                 .take_while(|(entry, node)| entry.node_id == node.id)
                 .count();
             stack.truncate(shared);
-            stack.extend(path[shared..].iter().map(|node| {
-                PathEntry {
+            for node in &path[shared..] {
+                let style = node.primary_styles();
+                let parent_group = stack.last().and_then(|entry| entry.group);
+                let opacity = style
+                    .as_ref()
+                    .map_or(1.0, |style| style.get_effects().opacity);
+                let group = if opacity < 1.0 {
+                    if !groups.iter().any(|group| group.node_id == node.id) {
+                        groups.push(OpacityGroup {
+                            node_id: node.id,
+                            parent: parent_group,
+                            opacity,
+                        });
+                    }
+                    Some(node.id)
+                } else {
+                    parent_group
+                };
+                let decorated = style
+                    .filter(|style| has_box_decorations(style))
+                    .map(|style| {
+                        let margin = node.inline_box_edges(containing_block_width).margin;
+                        let is_ltr = style.clone_direction() == Direction::Ltr;
+                        (
+                            margin.left as f64 * scale,
+                            margin.right as f64 * scale,
+                            is_ltr,
+                        )
+                    });
+                stack.push(PathEntry {
                     node_id: node.id,
-                    decorated: node
-                        .primary_styles()
-                        .filter(|style| has_box_decorations(style))
-                        .map(|style| {
-                            let margin = node.inline_box_edges(containing_block_width).margin;
-                            let is_ltr = style.clone_direction() == Direction::Ltr;
-                            (
-                                margin.left as f64 * scale,
-                                margin.right as f64 * scale,
-                                is_ltr,
-                            )
-                        }),
+                    group,
+                    decorated,
                     fragment: None,
-                }
-            }));
+                });
+            }
 
             for entry in &mut stack {
                 let Some((margin_left, margin_right, is_ltr)) = entry.decorated else {
@@ -189,6 +244,7 @@ pub(crate) fn collect_inline_fragments(
                     fragments.push(InlineFragment {
                         node_id: entry.node_id,
                         line_index,
+                        group: entry.group,
                         is_ltr,
                         x0: f64::INFINITY,
                         x1: f64::NEG_INFINITY,
@@ -228,7 +284,30 @@ pub(crate) fn collect_inline_fragments(
     }
 
     lay_out_strips(&mut fragments);
-    fragments
+    InlineBoxes { fragments, groups }
+}
+
+/// The combined opacity of the non-atomic inline elements that `node` is in, up to its inline
+/// root. Lacking boxes of their own, they don't otherwise apply it to the atomic inlines in them.
+pub(crate) fn inline_ancestor_opacity(doc: &BaseDocument, node: &Node, inline_root: &Node) -> f32 {
+    let root_parent = inline_root
+        .is_anonymous()
+        .then_some(inline_root.parent)
+        .flatten();
+    let mut opacity = 1.0;
+    let mut current = node.parent.and_then(|id| doc.get_node(id));
+    while let Some(ancestor) = current
+        && ancestor.id != inline_root.id
+        && Some(ancestor.id) != root_parent
+    {
+        if ancestor.is_non_atomic_inline() {
+            opacity *= ancestor
+                .primary_styles()
+                .map_or(1.0, |style| style.get_effects().opacity);
+        }
+        current = ancestor.parent.and_then(|id| doc.get_node(id));
+    }
+    opacity
 }
 
 /// The advance of the collapsible white space at the end of `line`.
@@ -322,11 +401,121 @@ fn has_box_decorations(style: &ComputedValues) -> bool {
 }
 
 impl BlitzDomPainter<'_, '_> {
+    /// Paints the inline content of `inline_root`, whose text layout is `text_layout`: its inline
+    /// elements' box decorations and its text, with the selection highlight `selection_rects`.
+    ///
+    /// Each line paints the box decorations of its inline elements, then the selection highlight
+    /// and the text. A line's decorations thus cover the text of the lines before it where they
+    /// overlap, as in browsers. Opacity groups are painted after the rest.
+    pub(crate) fn draw_inline_content(
+        &self,
+        scene: &mut impl PaintScene,
+        inline_root: &Node,
+        text_layout: &TextLayout,
+        transform: Affine,
+        selection_rects: &[(Rect, usize)],
+    ) {
+        let layout = inline_root.final_layout();
+        let containing_block_width = layout.size.width
+            - (layout.padding.left + layout.padding.right)
+            - (layout.border.left + layout.border.right);
+        let boxes = collect_inline_fragments(
+            self.dom,
+            text_layout,
+            inline_root,
+            containing_block_width,
+            self.scale,
+        );
+        let lines = InlineLines {
+            inline_root,
+            text_layout,
+            transform,
+            containing_block_width,
+            boxes: &boxes,
+        };
+        self.draw_inline_lines(scene, &lines, None, selection_rects);
+        for group in boxes.groups.iter().filter(|group| group.parent.is_none()) {
+            self.draw_opacity_group(scene, &lines, group);
+        }
+    }
+
+    /// Paints an opacity group, and the groups nested in it.
+    fn draw_opacity_group(
+        &self,
+        scene: &mut impl PaintScene,
+        lines: &InlineLines<'_>,
+        group: &OpacityGroup,
+    ) {
+        self.layer_manager.maybe_with_layer(
+            scene,
+            true,
+            BlendMode::default(),
+            group.opacity,
+            Affine::IDENTITY,
+            &self.viewport_rect(),
+            None,
+            None,
+            |scene| {
+                self.draw_inline_lines(scene, lines, Some(group.node_id), &[]);
+                let nested = lines.boxes.groups.iter();
+                for nested in nested.filter(|nested| nested.parent == Some(group.node_id)) {
+                    self.draw_opacity_group(scene, lines, nested);
+                }
+            },
+        );
+    }
+
+    /// Paints the lines' fragments and text in the given opacity group (or in none).
+    fn draw_inline_lines(
+        &self,
+        scene: &mut impl PaintScene,
+        lines: &InlineLines<'_>,
+        group: Option<NodeId>,
+        selection_rects: &[(Rect, usize)],
+    ) {
+        let mut fragments = (lines.boxes.fragments.iter())
+            .filter(|fragment| fragment.group == group)
+            .peekable();
+        for (line_index, line) in lines.text_layout.layout.lines().enumerate() {
+            while let Some(fragment) = fragments.next_if(|f| f.line_index == line_index) {
+                self.draw_inline_fragment(
+                    scene,
+                    fragment,
+                    lines.transform,
+                    lines.containing_block_width,
+                );
+            }
+            for (rect, _) in selection_rects.iter().filter(|(_, i)| *i == line_index) {
+                scene.fill(
+                    Fill::NonZero,
+                    lines.transform,
+                    SELECTION_COLOR,
+                    None,
+                    rect,
+                    AntiAliasing::Enabled,
+                );
+            }
+            crate::text::stroke_text(
+                scene,
+                std::iter::once(line),
+                self.dom,
+                lines.transform,
+                TextPaintOptions {
+                    scale: self.scale,
+                    brush_override: None,
+                    runs: RunFilter::Group(group),
+                },
+                lines.inline_root.id,
+                &mut self.draw_text_context.borrow_mut(),
+            );
+        }
+    }
+
     /// Paints the box decorations of an inline fragment.
     ///
     /// `transform` maps the text layout's coordinates to the scene, and `containing_block_width`
     /// (in CSS pixels) is the inline size of the inline root's content box.
-    pub(crate) fn draw_inline_fragment(
+    fn draw_inline_fragment(
         &self,
         scene: &mut impl PaintScene,
         fragment: &InlineFragment,

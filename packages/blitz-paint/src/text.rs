@@ -34,6 +34,18 @@ pub(crate) struct DrawTextContext {
 pub(crate) struct TextPaintOptions {
     pub scale: f64,
     pub brush_override: Option<Color>,
+    pub runs: RunFilter,
+}
+
+/// Which glyph runs of a layout to paint.
+///
+/// Non-atomic inline elements with an `opacity` below 1 are painted as groups of their own,
+/// each of which paints the runs in it but not those in the groups nested in it.
+#[derive(Clone, Copy)]
+pub(crate) enum RunFilter {
+    All,
+    /// The runs of the given group, or those in no group.
+    Group(Option<NodeId>),
 }
 
 pub(crate) fn stroke_text<'a>(
@@ -48,6 +60,7 @@ pub(crate) fn stroke_text<'a>(
     let TextPaintOptions {
         scale,
         brush_override,
+        runs,
     } = options;
     let DrawTextContext {
         stack,
@@ -115,6 +128,23 @@ pub(crate) fn stroke_text<'a>(
             for &node_id in &path_scratch[shared..] {
                 let entry = resolve_decoration_entry(doc, node_id, stack.last(), scale);
                 stack.push(entry);
+            }
+
+            // A run that isn't painted records no colour and no shadows, and contributes no
+            // decorations.
+            let is_painted = match runs {
+                RunFilter::All => true,
+                RunFilter::Group(group) => {
+                    let run_group = stack.iter().rev().find(|e| e.is_opacity_group);
+                    run_group.map(|e| e.node_id) == group
+                }
+            };
+            if !is_painted {
+                run_records.push(RunRecord {
+                    fill_color: Color::TRANSPARENT,
+                    shadows: None,
+                });
+                continue;
             }
 
             // The glyph colour and `text-shadow` come from the run's own node (the stack

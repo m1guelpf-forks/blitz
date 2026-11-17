@@ -138,3 +138,34 @@ fn collapsible_white_space_at_the_end_of_a_line_is_not_painted() {
     assert_eq!(pixel(&render(&html("normal")), 80, 50), WHITE, "removed");
     assert_eq!(pixel(&render(&html("pre-wrap")), 80, 50), RED, "hanging");
 }
+
+#[test]
+fn opacity_composites_an_inline_element_as_a_group() {
+    // The nested span's background covers its parent's, so the parent's shows only where
+    // the nested one isn't. Composited as one group, both are equally translucent.
+    let buffer = render(&format!(
+        "<span style='opacity:0.5;padding-left:20px;background:#f00'>\
+         <span style='background:#f00'>{}</span></span>",
+        spacer(20)
+    ));
+    let translucent_red = [255, 128, 128];
+    let close = |a: [u8; 3], b: [u8; 3]| a.iter().zip(b).all(|(a, b)| a.abs_diff(b) <= 2);
+    assert!(close(pixel(&buffer, 10, 50), translucent_red), "padding");
+    assert!(
+        close(pixel(&buffer, 30, 50), translucent_red),
+        "nested span"
+    );
+}
+
+#[test]
+fn opacity_applies_to_atomic_inlines_in_an_inline_element() {
+    let buffer = render(
+        "<span style='opacity:0.5'><i style='display:inline-block;width:20px;height:10px;\
+         background:#00f'></i></span>",
+    );
+    let pixel = pixel(&buffer, 10, 50);
+    assert!(
+        pixel[0].abs_diff(128) <= 2 && pixel[2] == 255,
+        "translucent blue: {pixel:?}"
+    );
+}

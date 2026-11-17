@@ -19,7 +19,7 @@ use crate::filters::convert_filters;
 use crate::kurbo_css::NonUniformRoundedRectRadii;
 use crate::layers::LayerManager;
 use crate::sizing::compute_object_fit;
-use crate::text::{DrawTextContext, TextPaintOptions};
+use crate::text::{DrawTextContext, RunFilter, TextPaintOptions};
 use crate::{CustomWidgetSceneMap, SELECTION_COLOR};
 use anyrender::{AntiAliasing, PaintScene, Scene};
 use blitz_dom::node::{
@@ -295,6 +295,16 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         }
     }
 
+    /// The viewport, in scene coordinates.
+    fn viewport_rect(&self) -> Rect {
+        Rect::new(
+            self.initial_x,
+            self.initial_y,
+            self.initial_x + self.width as f64,
+            self.initial_y + self.height as f64,
+        )
+    }
+
     fn node_transform(&self, node: &Node, parent: Affine) -> Affine {
         let location = node.final_layout().location;
         parent
@@ -411,6 +421,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                     TextPaintOptions {
                         scale: self.scale,
                         brush_override: Some(Color::BLACK),
+                        runs: RunFilter::All,
                     },
                     node.id,
                     &mut self.draw_text_context.borrow_mut(),
@@ -1027,17 +1038,6 @@ impl ElementCx<'_, '_> {
             let transform =
                 self.transform * Affine::translate((pos.x * self.scale, pos.y * self.scale));
 
-            let layout = self.node.final_layout();
-            let containing_block_width = layout.size.width
-                - (layout.padding.left + layout.padding.right)
-                - (layout.border.left + layout.border.right);
-            let fragments = inline_box::collect_inline_fragments(
-                self.context.dom,
-                text_layout,
-                self.node,
-                containing_block_width,
-                self.scale,
-            );
             let selection_rects = self
                 .context
                 .selection_ranges
@@ -1046,39 +1046,7 @@ impl ElementCx<'_, '_> {
                     crate::text::text_selection_rects(&text_layout.layout, start, end)
                 })
                 .unwrap_or_default();
-
-            // Each line paints the box decorations of its inline elements, then the selection
-            // highlight and the text. A line's decorations thus cover the text of the lines
-            // before it where they overlap, as in browsers.
-            let mut draw_text_context = self.context.draw_text_context.borrow_mut();
-            let mut fragments = fragments.iter().peekable();
-            for (line_index, line) in text_layout.layout.lines().enumerate() {
-                while let Some(fragment) = fragments.next_if(|f| f.line_index == line_index) {
-                    self.draw_inline_fragment(scene, fragment, transform, containing_block_width);
-                }
-                for (rect, _) in selection_rects.iter().filter(|(_, i)| *i == line_index) {
-                    scene.fill(
-                        Fill::NonZero,
-                        transform,
-                        SELECTION_COLOR,
-                        None,
-                        rect,
-                        AntiAliasing::Enabled,
-                    );
-                }
-                crate::text::stroke_text(
-                    scene,
-                    std::iter::once(line),
-                    self.context.dom,
-                    transform,
-                    TextPaintOptions {
-                        scale: self.scale,
-                        brush_override: None,
-                    },
-                    self.node.id,
-                    &mut draw_text_context,
-                );
-            }
+            self.draw_inline_content(scene, self.node, text_layout, transform, &selection_rects);
         }
     }
 
@@ -1147,6 +1115,7 @@ impl ElementCx<'_, '_> {
                 TextPaintOptions {
                     scale: self.scale,
                     brush_override: None,
+                    runs: RunFilter::All,
                 },
                 self.node.id,
                 &mut draw_text_context,
@@ -1206,6 +1175,7 @@ impl ElementCx<'_, '_> {
                 TextPaintOptions {
                     scale: self.scale,
                     brush_override: None,
+                    runs: RunFilter::All,
                 },
                 self.node.id,
                 &mut draw_text_context,
@@ -1261,7 +1231,22 @@ impl ElementCx<'_, '_> {
                 } else {
                     parent_style_transform
                 };
-                self.render_node(scene, *child_id, child_transform, clip_rect);
+                let opacity = if self.node.flags.is_inline_root() {
+                    inline_box::inline_ancestor_opacity(self.context.dom, child, self.node)
+                } else {
+                    1.0
+                };
+                self.layer_manager.maybe_with_layer(
+                    scene,
+                    opacity < 1.0,
+                    BlendMode::default(),
+                    opacity,
+                    Affine::IDENTITY,
+                    &self.viewport_rect(),
+                    None,
+                    None,
+                    |scene| self.render_node(scene, *child_id, child_transform, clip_rect),
+                );
             }
         }
 
