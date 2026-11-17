@@ -69,6 +69,9 @@ pub struct TableCell {
     pub row: u16,
     /// Index of the column the cell originates in
     pub column: u16,
+    /// Whether the cell has a length `width`, which only sets its column's preferred width (see
+    /// `compute_child_layout`)
+    has_length_width: bool,
     /// Whether the cell has a length `height`, which is only a minimum (see
     /// `compute_child_layout`)
     has_length_height: bool,
@@ -751,11 +754,13 @@ fn collect_table_cells(
                 style.size.height = style_helpers::auto();
             }
 
+            let has_length_width = style.size.width.tag() == taffy::CompactLength::LENGTH_TAG;
             style.size.width = style_helpers::auto();
             cells.push(TableCell {
                 node_id,
                 row: row.saturating_sub(1),
                 column: col,
+                has_length_width,
                 has_length_height,
                 style,
             });
@@ -818,6 +823,25 @@ impl taffy::TraversePartialTree for TableTreeWrapper<'_, '_> {
 }
 impl taffy::TraverseTree for TableTreeWrapper<'_, '_> {}
 
+impl TableTreeWrapper<'_, '_> {
+    /// Measures a cell without its own `width` and `height` (`SizingMode::ContentSize`). The
+    /// result isn't cached: a node's layout cache holds results for one sizing mode, so
+    /// storing it would evict the cell's other measurements, and measuring the cell again
+    /// re-measures its inline boxes from their own caches, which don't keep their baselines.
+    fn measure_content(
+        &mut self,
+        node_id: taffy::NodeId,
+        inputs: taffy::tree::LayoutInput,
+    ) -> taffy::LayoutOutput {
+        let inputs = taffy::tree::LayoutInput {
+            sizing_mode: taffy::SizingMode::ContentSize,
+            ..inputs
+        };
+        self.doc
+            .compute_child_layout_internal(node_id, inputs, None)
+    }
+}
+
 impl taffy::LayoutPartialTree for TableTreeWrapper<'_, '_> {
     type CoreContainerStyle<'a>
         = &'a taffy::Style<Atom>
@@ -846,30 +870,27 @@ impl taffy::LayoutPartialTree for TableTreeWrapper<'_, '_> {
     ) -> taffy::LayoutOutput {
         let cell = &self.ctx.cells[usize::from(node_id)];
         let node_id = crate::taffy_node_id(cell.node_id);
-        let mut inputs = inputs;
         // A cell's specified width is its column's preferred width, not a floor: the cell's
         // min-content width is that of its content (CSS Tables 3 §3.9.1), so a column can
         // shrink below the widths of its cells to fit the table's width.
-        if inputs.known_dimensions.width.is_none()
+        if cell.has_length_width
+            && inputs.known_dimensions.width.is_none()
             && inputs.available_space.width == taffy::AvailableSpace::MinContent
         {
-            inputs.sizing_mode = taffy::SizingMode::ContentSize;
+            return self.measure_content(node_id, inputs);
         }
         if cell.has_length_height {
             if inputs.known_dimensions.height.is_some() {
                 // Laid out at its row's height, the cell's content still resolves percentage
                 // heights against the cell's own height, as in browsers
+                let mut inputs = inputs;
                 inputs.known_dimensions_are_definite.height = false;
-            } else if inputs.axis != taffy::RequestedAxis::Horizontal {
+                return self.doc.compute_child_layout(node_id, inputs);
+            }
+            if inputs.axis != taffy::RequestedAxis::Horizontal {
                 // The cell's height is a minimum: it's as tall as its content when that's taller
                 let specified = self.doc.compute_child_layout(node_id, inputs);
-                let content = self.doc.compute_child_layout(
-                    node_id,
-                    taffy::tree::LayoutInput {
-                        sizing_mode: taffy::SizingMode::ContentSize,
-                        ..inputs
-                    },
-                );
+                let content = self.measure_content(node_id, inputs);
                 return if content.size.height > specified.size.height {
                     content
                 } else {

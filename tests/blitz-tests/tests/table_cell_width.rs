@@ -44,3 +44,19 @@ fn cell_widths_stay_preferred_widths_when_they_fit() {
         [300.0, 100.0, 200.0, 300.0]
     );
 }
+
+#[test]
+fn inline_blocks_in_cells_with_a_width_keep_their_baseline() {
+    // A button-style link in a nested email layout: measuring the cell's min-content width
+    // must not cost the link its baseline, which would add the line's descent below it.
+    let harness = Harness::from_html(
+        "<body style='margin:0;font:14px/24px sans-serif'><table width='100%' cellpadding=0 cellspacing=0>\
+         <tr><td style='padding:24px 12px'><table width=600 cellpadding=0 cellspacing=0 style='width:100%'>\
+         <tr><td style='padding:20px 32px'>Header</td></tr>\
+         <tr><td id=cell width=536 style='padding:0 32px 32px'>\
+         <a id=button style='display:inline-block;padding:12px 22px'>Read today's edition</a></td></tr>\
+         </table></td></tr></table></body>",
+    );
+    let (cell, button) = (harness.layout_rect("#cell"), harness.layout_rect("#button"));
+    assert_eq!((button.y, cell.height), (cell.y, button.height + 32.0));
+}
