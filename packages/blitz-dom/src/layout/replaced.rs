@@ -322,10 +322,39 @@ pub fn compute_replaced_layout(
         return LayoutOutput::from_sizes(size + pb_sum, overflow_rect_for(size));
     }
 
+    // With a specified `width` or `height`, that axis keeps its value (within its own min and
+    // max) and the other is transferred from it through the aspect ratio, then clamped by its
+    // own min and max (CSS 2.1 §10.3.2, §10.4, §10.6.2, §10.7). The clamping table below is
+    // only for when both are `auto`.
+    if let (Some(aspect_ratio), true) = (
+        aspect_ratio,
+        style_size.width.is_some() | style_size.height.is_some(),
+    ) {
+        let size = match (style_size.width, style_size.height) {
+            (Some(width), None) => {
+                let width = width.maybe_clamp(min_size.width, max_size.width);
+                Size {
+                    width,
+                    height: (width / aspect_ratio).maybe_clamp(min_size.height, max_size.height),
+                }
+            }
+            (None, Some(height)) => {
+                let height = height.maybe_clamp(min_size.height, max_size.height);
+                Size {
+                    width: (height * aspect_ratio).maybe_clamp(min_size.width, max_size.width),
+                    height,
+                }
+            }
+            _ => style_size
+                .unwrap_or(inherent_size)
+                .maybe_clamp(min_size, max_size),
+        };
+        let size = size.map(|s| s.max(0.0));
+        return LayoutOutput::from_sizes(size + pb_sum, overflow_rect_for(size));
+    }
+
     let unclamped_size = if style_size.width.is_some() | style_size.height.is_some() {
-        style_size
-            .maybe_apply_aspect_ratio(aspect_ratio)
-            .unwrap_or(inherent_size)
+        style_size.unwrap_or(inherent_size)
     } else {
         inherent_size
     };
