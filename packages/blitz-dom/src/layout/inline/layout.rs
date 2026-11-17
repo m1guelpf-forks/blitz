@@ -25,6 +25,7 @@ use stylo_taffy::StyleFlags;
 
 use crate::layout::LayoutPassState;
 use crate::layout::resolve_calc_value;
+use crate::node::{InlineBoxRef, InlineEdge};
 use crate::stylo_to_parley;
 
 /// Subtract a child's margins from the definite axes of the available space it is laid out in.
@@ -302,6 +303,34 @@ impl LayoutPassState<'_> {
         }
     }
 
+    /// The space an [edge box](InlineBoxRef::Edge) reserves in the line: the margin, border and
+    /// padding of the given inline-axis edge of the non-atomic inline element `node_id`, with
+    /// percentages resolved against `percent_basis` (the containing block's inline size).
+    fn inline_edge_width(
+        &self,
+        node_id: NodeId,
+        edge: InlineEdge,
+        percent_basis: Option<f32>,
+    ) -> f32 {
+        let style = self.child_layout_style(&self.nodes[node_id]);
+        let margin = style
+            .margin()
+            .resolve_or_zero(percent_basis, resolve_calc_value);
+        let border = style
+            .border()
+            .resolve_or_zero(percent_basis, resolve_calc_value);
+        let padding = style
+            .padding()
+            .resolve_or_zero(percent_basis, resolve_calc_value);
+        let spacing = margin + border + padding;
+        match (edge, style.direction()) {
+            (InlineEdge::Start, Direction::Ltr) | (InlineEdge::End, Direction::Rtl) => spacing.left,
+            (InlineEdge::Start, Direction::Rtl) | (InlineEdge::End, Direction::Ltr) => {
+                spacing.right
+            }
+        }
+    }
+
     /// The out-of-flow positions for which an inline span between the inline box `box_id` and its
     /// inline root `root_id` is a containing block (as `SPAN_*_CB` flags)
     fn inline_span_cb_flags(&self, root_id: NodeId, box_id: NodeId) -> StyleFlags {
@@ -510,7 +539,16 @@ impl LayoutPassState<'_> {
         let inline_box_count = inline_layout.layout.inline_boxes().len();
         for index in 0..inline_box_count {
             inline_layout.layout.edit_inline_box(index, |ibox| {
-                let style = self.child_layout_style(&self.nodes[NodeId::from_u64(ibox.id)]);
+                let node_id = match InlineBoxRef::from_id(ibox.id) {
+                    InlineBoxRef::Node(node_id) => node_id,
+                    InlineBoxRef::Edge(node_id, edge) => {
+                        ibox.width =
+                            self.inline_edge_width(node_id, edge, child_inputs.parent_size.width)
+                                * scale;
+                        return;
+                    }
+                };
+                let style = self.child_layout_style(&self.nodes[node_id]);
                 let margin = style
                     .margin()
                     .resolve_or_zero(inputs.parent_size, resolve_calc_value);
@@ -557,7 +595,7 @@ impl LayoutPassState<'_> {
                     ibox.baseline = None;
                 } else {
                     let output =
-                        self.compute_child_layout(taffy::NodeId::from(ibox.id), box_inputs);
+                        self.compute_child_layout(crate::taffy_node_id(node_id), box_inputs);
                     ibox.width = (margin.left + margin.right + output.size.width) * scale;
                     ibox.baseline = if exports_baseline {
                         let baseline = if uses_last_baseline {
@@ -626,9 +664,11 @@ impl LayoutPassState<'_> {
                     AvailableSpace::MinContent => {
                         let mut width: f32 = 0.0;
                         for ibox in inline_layout.layout.inline_boxes() {
+                            let InlineBoxRef::Node(box_id) = InlineBoxRef::from_id(ibox.id) else {
+                                continue;
+                            };
                             let (is_floated, margin) = {
-                                let style =
-                                    self.child_layout_style(&self.nodes[NodeId::from_u64(ibox.id)]);
+                                let style = self.child_layout_style(&self.nodes[box_id]);
                                 (
                                     style.float().is_floated(),
                                     style
@@ -639,7 +679,7 @@ impl LayoutPassState<'_> {
 
                             if is_floated {
                                 let output = self.compute_child_layout(
-                                    taffy::NodeId::from(ibox.id),
+                                    crate::taffy_node_id(box_id),
                                     subtract_margins(child_inputs, margin),
                                 );
                                 width = width.max(output.size.width + margin.left + margin.right);
@@ -663,9 +703,11 @@ impl LayoutPassState<'_> {
                         let mut right_band: f32 = 0.0;
                         let mut width: f32 = 0.0;
                         for ibox in inline_layout.layout.inline_boxes() {
+                            let InlineBoxRef::Node(box_id) = InlineBoxRef::from_id(ibox.id) else {
+                                continue;
+                            };
                             let (float, clear, margin) = {
-                                let style =
-                                    self.child_layout_style(&self.nodes[NodeId::from_u64(ibox.id)]);
+                                let style = self.child_layout_style(&self.nodes[box_id]);
                                 (
                                     style.float(),
                                     style.clear(),
@@ -684,7 +726,7 @@ impl LayoutPassState<'_> {
                                 }
 
                                 let output = self.compute_child_layout(
-                                    taffy::NodeId::from(ibox.id),
+                                    crate::taffy_node_id(box_id),
                                     subtract_margins(child_inputs, margin),
                                 );
                                 let box_width = output.size.width + margin.left + margin.right;
@@ -1117,13 +1159,16 @@ impl LayoutPassState<'_> {
                     line_has_in_flow_content |= run.advance() > 0.0;
                 }
                 if let parley::layout::PositionedLayoutItem::InlineBox(ibox) = item {
+                    let InlineBoxRef::Node(box_id) = InlineBoxRef::from_id(ibox.id) else {
+                        line_has_in_flow_content |= ibox.width > 0.0;
+                        continue;
+                    };
                     let order = ibox_order;
                     ibox_order += 1;
                     if inputs.run_mode == RunMode::PerformLayout {
-                        span_cb_flags |=
-                            self.inline_span_cb_flags(node_id, NodeId::from_u64(ibox.id));
+                        span_cb_flags |= self.inline_span_cb_flags(node_id, box_id);
                     }
-                    let node = &self.nodes[NodeId::from_u64(ibox.id)];
+                    let node = &self.nodes[box_id];
                     let style = self.child_layout_style(node);
                     let padding = style
                         .padding()
@@ -1217,7 +1262,7 @@ impl LayoutPassState<'_> {
                         };
 
                         oof_candidates.push(OofCandidate {
-                            node: taffy::NodeId::from(ibox.id),
+                            node: crate::taffy_node_id(box_id),
                             order,
                             position,
                             static_position: taffy::Point {
@@ -1242,7 +1287,7 @@ impl LayoutPassState<'_> {
                             },
                         });
                     } else if is_floated {
-                        let layout = self.nodes[NodeId::from_u64(ibox.id)].unrounded_layout_mut();
+                        let layout = self.nodes[box_id].unrounded_layout_mut();
                         layout.padding = padding; //.map(|p| p / scale);
                         layout.border = border; //.map(|p| p / scale);
                         layout.margin = margin;
@@ -1252,9 +1297,9 @@ impl LayoutPassState<'_> {
                         // cache). The size cannot be recovered from `ibox` dimensions as the
                         // space reserved in the line is clamped to be non-negative.
                         let mut output =
-                            self.compute_child_layout(taffy::NodeId::from(ibox.id), box_inputs);
+                            self.compute_child_layout(crate::taffy_node_id(box_id), box_inputs);
                         let size = output.size;
-                        let node = &mut self.nodes[NodeId::from_u64(ibox.id)];
+                        let node = &mut self.nodes[box_id];
 
                         let is_relative = position == taffy::Position::Relative;
                         let inset_offset = if is_relative {

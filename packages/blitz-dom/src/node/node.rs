@@ -17,6 +17,7 @@ use std::fmt::Write;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use style::computed_values::direction::T as StyloDirection;
 use style::computed_values::flex_direction::T as FlexDirection;
 use style::computed_values::isolation::T as Isolation;
 use style::computed_values::overflow_x::T as Overflow;
@@ -42,7 +43,7 @@ use taffy::{Cache, prelude::Layout};
 use thin_vec::ThinVec;
 
 use super::stylo_data::{ComputedStyleRef, StyloData};
-use super::{Attribute, DocumentData, ElementData, LayoutData};
+use super::{Attribute, DocumentData, ElementData, InlineBoxRef, InlineEdge, LayoutData};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayOuter {
@@ -1778,6 +1779,21 @@ impl Node {
         })
     }
 
+    /// The margin, border and padding of a non-atomic inline element (which has no layout box to
+    /// read them from), in CSS pixels, with percentages resolved against the inline size of its
+    /// containing block.
+    pub fn inline_box_edges(&self, containing_block_width: f32) -> BoxEdges {
+        use taffy::{CoreStyle as _, ResolveOrZero as _};
+        let style = self.layout_style();
+        let basis = Some(containing_block_width);
+        let resolve = crate::layout::resolve_calc_value;
+        BoxEdges {
+            margin: style.margin().resolve_or_zero(basis, resolve),
+            border: style.border().resolve_or_zero(basis, resolve),
+            padding: style.padding().resolve_or_zero(basis, resolve),
+        }
+    }
+
     /// The node whose box this node's `Layout.location` is relative to: the
     /// `oof_containing_block` for a hoisted out-of-flow box, otherwise the
     /// `layout_parent`.
@@ -1872,6 +1888,12 @@ impl Node {
         let content_box_inset = root_layout.padding + root_layout.border;
         let origin_x = content_box_inset.left;
         let origin_y = content_box_inset.top + inline_layout.block_offset;
+        let margin = self
+            .inline_box_edges(root_layout.size.width - content_box_inset.horizontal_axis_sum())
+            .margin;
+        let is_rtl = self
+            .primary_styles()
+            .is_some_and(|style| style.clone_direction() == StyloDirection::Rtl);
 
         fn union(acc: &mut Option<taffy::Rect<f32>>, left: f32, top: f32, right: f32, bottom: f32) {
             *acc = Some(match *acc {
@@ -1913,18 +1935,31 @@ impl Node {
                         union(&mut line_rect, x0, y0, x1, y1);
                     }
                     PositionedLayoutItem::InlineBox(inline_box) => {
-                        if !is_in_target(NodeId::from_u64(inline_box.id)) {
-                            continue;
+                        let mut x0 = inline_box.x;
+                        let mut x1 = x0 + inline_box.width;
+                        match InlineBoxRef::from_id(inline_box.id) {
+                            InlineBoxRef::Node(id) if is_in_target(id) => {
+                                let y0 = inline_box.y;
+                                union(&mut line_rect, x0, y0, x1, y0 + inline_box.height);
+                            }
+                            InlineBoxRef::Edge(id, edge) if is_in_target(id) => {
+                                // The target's own edges include its margin, which is outside
+                                // of its border box.
+                                if id == self.id {
+                                    match (edge, is_rtl) {
+                                        (InlineEdge::Start, false) | (InlineEdge::End, true) => {
+                                            x0 += margin.left * scale
+                                        }
+                                        (InlineEdge::Start, true) | (InlineEdge::End, false) => {
+                                            x1 -= margin.right * scale
+                                        }
+                                    }
+                                }
+                                let y0 = line_metrics.block_min_coord;
+                                union(&mut line_rect, x0, y0, x1, line_metrics.block_max_coord);
+                            }
+                            _ => {}
                         }
-                        let x0 = inline_box.x;
-                        let y0 = inline_box.y;
-                        union(
-                            &mut line_rect,
-                            x0,
-                            y0,
-                            x0 + inline_box.width,
-                            y0 + inline_box.height,
-                        );
                     }
                 }
             }
@@ -2174,6 +2209,14 @@ pub(crate) fn style_is_out_of_flow(style: &ComputedValues) -> bool {
     let box_style = style.get_box();
     matches!(box_style.position, Position::Absolute | Position::Fixed)
         && !box_style.display.is_none()
+}
+
+/// The margin, border and padding of a box, in CSS pixels.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BoxEdges {
+    pub margin: taffy::Rect<f32>,
+    pub border: taffy::Rect<f32>,
+    pub padding: taffy::Rect<f32>,
 }
 
 #[cfg(test)]

@@ -40,6 +40,7 @@ mod incremental_oracle;
 mod inline_bfc_padding;
 mod inline_box_baseline;
 mod inline_box_scrollable_overflow;
+mod inline_edge_spacing;
 mod inline_fragment_rects;
 mod inline_svg_restyle;
 mod inline_svg_serialize;

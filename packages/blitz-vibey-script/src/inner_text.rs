@@ -3,7 +3,7 @@
 //! Self-contained so that it can move into `blitz-dom` later.
 
 use blitz_dom::CopyStyleGetters;
-use blitz_dom::node::{ListItemLayoutPosition, Marker, TextBrush, TextLayout};
+use blitz_dom::node::{InlineBoxRef, ListItemLayoutPosition, Marker, TextBrush, TextLayout};
 use blitz_dom::{Node, NodeId};
 use markup5ever::local_name;
 use style::computed_values::visibility::T as Visibility;
@@ -234,7 +234,11 @@ impl InnerTextCollector {
     }
 
     fn visit_inline_box(&mut self, root: &Node, id: u64, filter: Option<NodeId>) {
-        let node = root.with(NodeId::from_u64(id));
+        // Edge boxes are the margins, borders and paddings of inline elements, not content
+        let InlineBoxRef::Node(id) = InlineBoxRef::from_id(id) else {
+            return;
+        };
+        let node = root.with(id);
         if filter.is_none_or(|target| is_inclusive_descendant_of(node, target)) {
             self.visit(node, None);
         }

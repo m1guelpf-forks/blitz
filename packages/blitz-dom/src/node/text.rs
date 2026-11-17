@@ -50,16 +50,30 @@ impl TextLayout {
             .get_or_insert_with(|| self.layout.calculate_content_widths())
     }
 
-    /// Whether `byte_index` of `text` is the U+FFFC character that stands in for an in-flow
-    /// inline box.
+    /// Whether `byte_index` of `text` is a character that stands in for an inline box rather than
+    /// being part of the document's text: the U+FFFC character of an in-flow inline box, or the
+    /// [`EDGE_JOINER`] that glues an edge box to its element's content.
     pub fn is_inline_box_char(&self, byte_index: usize) -> bool {
-        self.text
-            .get(byte_index..)
-            .is_some_and(|rest| rest.starts_with(INLINE_BOX_CHAR))
-            && self
+        let rest = self.text.get(byte_index..).unwrap_or_default();
+        if rest.starts_with(INLINE_BOX_CHAR) {
+            return self
                 .layout
                 .inline_boxes()
-                .any(|ibox| ibox.kind == InlineBoxKind::InFlow && ibox.index == byte_index)
+                .any(|ibox| ibox.kind == InlineBoxKind::InFlow && ibox.index == byte_index);
+        }
+        if !rest.starts_with(EDGE_JOINER) {
+            return false;
+        }
+        // A start edge box is followed by its joiner, and an end edge box preceded by it
+        let start_edge_index = byte_index.checked_sub(INLINE_BOX_CHAR.len_utf8());
+        let end_edge_index = byte_index + EDGE_JOINER.len_utf8();
+        self.layout
+            .inline_boxes()
+            .any(|ibox| match InlineBoxRef::from_id(ibox.id) {
+                InlineBoxRef::Edge(_, InlineEdge::Start) => Some(ibox.index) == start_edge_index,
+                InlineBoxRef::Edge(_, InlineEdge::End) => ibox.index == end_edge_index,
+                InlineBoxRef::Node(_) => false,
+            })
     }
 
     /// The byte index in `text` of the U+FFFC character that stands in for `node_id`, if it is
@@ -74,6 +88,65 @@ impl TextLayout {
 
 /// The character Parley places in the text for each in-flow inline box.
 pub const INLINE_BOX_CHAR: char = '\u{FFFC}';
+
+/// The character that glues an [edge box](InlineBoxRef::Edge) to its element's content.
+///
+/// Parley allows a line break on either side of every in-flow inline box, but a U+2060 WORD
+/// JOINER prohibits them, so an edge box never wraps apart from the content next to it.
+pub const EDGE_JOINER: char = '\u{2060}';
+
+/// What an inline box of a [`TextLayout`] stands for, as encoded in its id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlineBoxRef {
+    /// An atomic inline (e.g. an `inline-block` or an image), or a floated or absolutely
+    /// positioned box.
+    Node(NodeId),
+    /// An in-flow box that reserves the margin, border and padding of the given edge of a
+    /// non-atomic inline element (which is otherwise just a style span of the layout).
+    ///
+    /// The start edge box is placed before the element's content and the end edge box after it,
+    /// so with `box-decoration-break: slice` the start edge is on the element's first line box
+    /// fragment and the end edge on its last.
+    Edge(NodeId, InlineEdge),
+}
+
+/// An inline-axis edge of a non-atomic inline element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InlineEdge {
+    Start,
+    End,
+}
+
+impl InlineBoxRef {
+    // Node ids are slab indices, so the top bits of the box id are free to tag edge boxes with
+    const EDGE_BIT: u64 = 1 << 63;
+    const END_BIT: u64 = 1 << 62;
+
+    /// Decodes the id of an inline box of a [`TextLayout`].
+    pub fn from_id(id: u64) -> Self {
+        if id & Self::EDGE_BIT == 0 {
+            return Self::Node(NodeId::from_u64(id));
+        }
+        let node_id = NodeId::from_u64(id & !(Self::EDGE_BIT | Self::END_BIT));
+        let edge = if id & Self::END_BIT == 0 {
+            InlineEdge::Start
+        } else {
+            InlineEdge::End
+        };
+        Self::Edge(node_id, edge)
+    }
+
+    /// The id of the inline box that stands for `self`.
+    pub fn id(self) -> u64 {
+        match self {
+            Self::Node(node_id) => node_id.as_u64(),
+            Self::Edge(node_id, InlineEdge::Start) => node_id.as_u64() | Self::EDGE_BIT,
+            Self::Edge(node_id, InlineEdge::End) => {
+                node_id.as_u64() | Self::EDGE_BIT | Self::END_BIT
+            }
+        }
+    }
+}
 
 impl std::fmt::Debug for TextLayout {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

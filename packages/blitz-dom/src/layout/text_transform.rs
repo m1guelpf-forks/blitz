@@ -237,7 +237,7 @@ fn math_auto(text: &str, output: &mut OutputSink<'_>) {
 }
 
 /// Whether Parley collapses `c` with the given `white-space-collapse`.
-fn is_collapsible(white_space_collapse: WhiteSpaceCollapse, c: char) -> bool {
+pub(crate) fn is_collapsible(white_space_collapse: WhiteSpaceCollapse, c: char) -> bool {
     match white_space_collapse {
         WhiteSpaceCollapse::Collapse => c.is_ascii_whitespace(),
         WhiteSpaceCollapse::PreserveBreaks => matches!(c, ' ' | '\t'),

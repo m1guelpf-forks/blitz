@@ -1,12 +1,18 @@
+use app_units::Au;
 use blitz_traits::node_id::NodeId;
 use markup5ever::local_name;
 use parley::{
-    FontContext, InlineBox, InlineBoxKind, LayoutContext, TreeBuilder, WhiteSpaceCollapse,
+    FontContext, InlineBox, InlineBoxKind, LayoutContext, LineBreakContext, LineBreakOverrideFn,
+    TreeBuilder, VerticalAlign, WhiteSpaceCollapse,
 };
 use style::{
+    Zero as _,
     computed_values::position::T as PositionProperty,
+    computed_values::white_space_collapse::T as StyloWhiteSpaceCollapse,
+    properties::ComputedValues,
     values::{
         computed::{Display, Float},
+        generics::length::GenericMargin,
         specified::box_::{DisplayInside, DisplayOutside},
     },
 };
@@ -16,8 +22,11 @@ use crate::{
     NodeData,
     layout::list::BULLET_FONT_FAMILY,
     layout::replaced::is_inline_box_element,
-    layout::text_transform::{CaseTransform, TextTransformer},
-    node::{ListItemLayout, ListItemLayoutPosition, Marker, TextBrush, TextLayout},
+    layout::text_transform::{CaseTransform, TextTransformer, is_collapsible},
+    node::{
+        EDGE_JOINER, InlineBoxRef, InlineEdge, ListItemLayout, ListItemLayoutPosition, Marker,
+        TextBrush, TextLayout,
+    },
     stylo_to_parley,
 };
 
@@ -86,11 +95,13 @@ pub(crate) fn build_inline_layout_into(
     // The marker is a separate box, so words in the content don't continue from it.
     let mut text_transformer = TextTransformer::default();
     text_transformer.word_break(&builder);
+    let mut edges = EdgeBoxes::default();
 
     if let Some(before_id) = root_node.before() {
         build_inline_layout_recursive(
             &mut builder,
             &mut text_transformer,
+            &mut edges,
             nodes,
             before_id,
             &text_transform,
@@ -100,6 +111,7 @@ pub(crate) fn build_inline_layout_into(
         build_inline_layout_recursive(
             &mut builder,
             &mut text_transformer,
+            &mut edges,
             nodes,
             child_id,
             &text_transform,
@@ -109,18 +121,23 @@ pub(crate) fn build_inline_layout_into(
         build_inline_layout_recursive(
             &mut builder,
             &mut text_transformer,
+            &mut edges,
             nodes,
             after_id,
             &text_transform,
         );
     }
 
+    if edges.any {
+        builder.set_line_break_override(Some(NO_BREAK_AT_EDGE_JOINER));
+    }
     text_layout.text = builder.build_into(&mut text_layout.layout);
     return;
 
     fn build_inline_layout_recursive(
         builder: &mut TreeBuilder<TextBrush>,
         text_transformer: &mut TextTransformer,
+        edges: &mut EdgeBoxes,
         nodes: &crate::NodeTree,
         node_id: NodeId,
         parent_text_transform: &CaseTransform,
@@ -173,6 +190,7 @@ pub(crate) fn build_inline_layout_into(
                                 ),
                             ]
                         });
+                        edges.enter_span(builder);
                         builder.push_style_modification_span(
                             whitespace
                                 .as_ref()
@@ -183,6 +201,7 @@ pub(crate) fn build_inline_layout_into(
                             build_inline_layout_recursive(
                                 builder,
                                 text_transformer,
+                                edges,
                                 nodes,
                                 child_id,
                                 &text_transform,
@@ -195,6 +214,7 @@ pub(crate) fn build_inline_layout_into(
 
                         if is_inline_box_element(tag_name) {
                             if box_kind == InlineBoxKind::InFlow {
+                                edges.before_content(builder);
                                 text_transformer.word_break(builder);
                             }
                             builder.push_inline_box(InlineBox {
@@ -214,6 +234,7 @@ pub(crate) fn build_inline_layout_into(
                         } else if *tag_name == local_name!("br") {
                             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                             // TODO: update span id for br spans
+                            edges.before_content(builder);
                             builder.push_style_modification_span(&[
                                 parley::StyleProperty::WhiteSpaceCollapse(
                                     WhiteSpaceCollapse::Preserve,
@@ -232,12 +253,20 @@ pub(crate) fn build_inline_layout_into(
                                     ..Default::default()
                                 });
 
+                            let has_edges = node
+                                .primary_styles()
+                                .is_some_and(|style| has_inline_edge_spacing(&style));
+                            edges.enter_span(builder);
                             builder.push_style_span(style);
+                            if has_edges {
+                                edges.push_edge(builder, node_id, InlineEdge::Start);
+                            }
 
                             if let Some(before_id) = node.before() {
                                 build_inline_layout_recursive(
                                     builder,
                                     text_transformer,
+                                    edges,
                                     nodes,
                                     before_id,
                                     &text_transform,
@@ -248,6 +277,7 @@ pub(crate) fn build_inline_layout_into(
                                 build_inline_layout_recursive(
                                     builder,
                                     text_transformer,
+                                    edges,
                                     nodes,
                                     child_id,
                                     &text_transform,
@@ -257,18 +287,23 @@ pub(crate) fn build_inline_layout_into(
                                 build_inline_layout_recursive(
                                     builder,
                                     text_transformer,
+                                    edges,
                                     nodes,
                                     after_id,
                                     &text_transform,
                                 );
                             }
 
+                            if has_edges {
+                                edges.push_edge(builder, node_id, InlineEdge::End);
+                            }
                             builder.pop_style_span();
                         }
                     }
                     // Inline box
                     (_, _) => {
                         if box_kind == InlineBoxKind::InFlow {
+                            edges.before_content(builder);
                             text_transformer.word_break(builder);
                         }
                         builder.push_inline_box(InlineBox {
@@ -294,12 +329,182 @@ pub(crate) fn build_inline_layout_into(
 
                 let text =
                     text_transformer.transform(&data.content, parent_text_transform, builder);
-                builder.push_text(text);
+                edges.push_text(builder, text, || {
+                    node.parent
+                        .and_then(|parent_id| nodes[parent_id].primary_styles())
+                        .map_or(StyloWhiteSpaceCollapse::Collapse, |s| {
+                            s.clone_white_space_collapse()
+                        })
+                });
             }
             NodeData::Comment { .. } => {
                 // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
             }
             NodeData::Document(_) => unreachable!(),
+        }
+    }
+}
+
+/// Whether a non-atomic inline element with `style` has margin, border or padding on its
+/// inline-axis edges, which [edge boxes](InlineBoxRef::Edge) then reserve space in the line for.
+pub(crate) fn has_inline_edge_spacing(style: &ComputedValues) -> bool {
+    let (margin, padding, border) = (style.get_margin(), style.get_padding(), style.get_border());
+    let (margins, paddings, borders) = if style.writing_mode.is_vertical() {
+        (
+            [&margin.margin_top, &margin.margin_bottom],
+            [&padding.padding_top, &padding.padding_bottom],
+            [
+                (&border.border_top_width, border.border_top_style),
+                (&border.border_bottom_width, border.border_bottom_style),
+            ],
+        )
+    } else {
+        (
+            [&margin.margin_left, &margin.margin_right],
+            [&padding.padding_left, &padding.padding_right],
+            [
+                (&border.border_left_width, border.border_left_style),
+                (&border.border_right_width, border.border_right_style),
+            ],
+        )
+    };
+    // `auto` margins are zero on non-atomic inlines
+    margins.into_iter().any(|margin| match margin {
+        GenericMargin::LengthPercentage(lp) => !lp.is_zero(),
+        GenericMargin::Auto => false,
+        _ => true,
+    }) || paddings.into_iter().any(|padding| !padding.0.is_zero())
+        || borders
+            .into_iter()
+            .any(|(width, style)| !style.none_or_hidden() && width.0 != Au(0))
+}
+
+/// Overrides the line break opportunities that Parley allows on either side of every in-flow
+/// inline box, so that an [`EDGE_JOINER`] glues edge boxes to their element's content.
+static NO_BREAK_AT_EDGE_JOINER: &LineBreakOverrideFn =
+    &|cx: LineBreakContext| (cx.before == EDGE_JOINER || cx.after == EDGE_JOINER).then_some(false);
+
+/// Builds the [edge boxes](InlineBoxRef::Edge) of non-atomic inline elements, which reserve the
+/// space of their inline-start and inline-end margin, border and padding.
+///
+/// An edge box is an in-flow inline box (whose width is set during layout) glued to the element's
+/// content by an [`EDGE_JOINER`], so that it stays on the line of the content next to it. Edge boxes
+/// are not content as far as white space processing is concerned (CSS Text 3 §4.1.1): white space
+/// on either side of one collapses together, as does white space between one and the start or
+/// end of the line. This is done here rather than by Parley's builder, which sees an edge box as
+/// content:
+///  - Collapsible white space that starts after an edge box placed after a collapsible space (or
+///    at the start of the paragraph) is skipped.
+///  - Trailing collapsible white space in an element with edge boxes is held back until more
+///    content follows, so that it collapses into white space after the element's end edge (and is
+///    removed with it at the end of the paragraph) instead of ending up inside it.
+#[derive(Default)]
+struct EdgeBoxes {
+    /// Whether any edge box has been pushed.
+    any: bool,
+    /// Whether collapsible white space at the start of the next text must be skipped.
+    skip_leading_space: bool,
+    /// Whether a collapsible space is being held back from the builder.
+    held_space: bool,
+    /// The number of elements with edge boxes that are being built.
+    open_elements: usize,
+}
+
+impl EdgeBoxes {
+    /// Pushes the edge box for `edge` of `node_id`, whose span must be the current one.
+    fn push_edge(
+        &mut self,
+        builder: &mut TreeBuilder<TextBrush>,
+        node_id: NodeId,
+        edge: InlineEdge,
+    ) {
+        let text = builder.text();
+        self.skip_leading_space |= builder.has_pending_whitespace()
+            || text.is_empty()
+            || text.ends_with(['\n', '\r', '\u{2028}', '\u{2029}']);
+        self.any = true;
+
+        let edge_box = InlineBox {
+            id: InlineBoxRef::Edge(node_id, edge).id(),
+            kind: InlineBoxKind::InFlow,
+            // Overridden by push_inline_box method
+            index: 0,
+            // The width is set during layout, and the box sits on the element's baseline
+            width: 0.0,
+            height: 0.0,
+            baseline: Some(0.0),
+            vertical_align: VerticalAlign::BASELINE,
+        };
+        let mut joiner = [0; 4];
+        let joiner = EDGE_JOINER.encode_utf8(&mut joiner);
+        match edge {
+            InlineEdge::Start => {
+                self.open_elements += 1;
+                builder.push_inline_box(edge_box);
+                builder.push_text(joiner);
+            }
+            InlineEdge::End => {
+                self.open_elements -= 1;
+                builder.push_text(joiner);
+                builder.push_inline_box(edge_box);
+            }
+        }
+    }
+
+    /// Prepares for starting a span, whose content the held back space (if any) comes before.
+    fn enter_span(&mut self, builder: &mut TreeBuilder<TextBrush>) {
+        if std::mem::take(&mut self.held_space) {
+            builder.push_text(" ");
+        }
+    }
+
+    /// Prepares for pushing content other than text, such as an atomic inline or a line break.
+    fn before_content(&mut self, builder: &mut TreeBuilder<TextBrush>) {
+        self.enter_span(builder);
+        self.skip_leading_space = false;
+    }
+
+    /// Pushes `text`, applying the white space collapsing around edge boxes.
+    fn push_text(
+        &mut self,
+        builder: &mut TreeBuilder<TextBrush>,
+        text: &str,
+        white_space_collapse: impl FnOnce() -> StyloWhiteSpaceCollapse,
+    ) {
+        if !self.skip_leading_space && !self.held_space && self.open_elements == 0 {
+            builder.push_text(text);
+            return;
+        }
+
+        let white_space_collapse = white_space_collapse();
+        let is_space = |c| is_collapsible(white_space_collapse, c);
+        let Some(content_start) = text.find(|c| !is_space(c)) else {
+            // Only white space, which collapses into the space before it if there is one
+            if !text.is_empty() && !self.skip_leading_space {
+                self.held_space = true;
+            }
+            return;
+        };
+        let content_end = text.trim_end_matches(is_space).len();
+
+        let leading_space = &text[..content_start];
+        if !std::mem::take(&mut self.skip_leading_space) {
+            if !leading_space.is_empty() {
+                builder.push_text(leading_space);
+            } else if self.held_space {
+                builder.push_text(" ");
+            }
+        }
+        self.held_space = false;
+        builder.push_text(&text[content_start..content_end]);
+
+        let trailing_space = &text[content_end..];
+        if !trailing_space.is_empty() {
+            if self.open_elements > 0 {
+                self.held_space = true;
+            } else {
+                builder.push_text(trailing_space);
+            }
         }
     }
 }

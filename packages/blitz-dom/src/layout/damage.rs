@@ -3,6 +3,7 @@ use blitz_traits::node_id::NodeId;
 use markup5ever::local_name;
 use stylo_taffy::CopyStyleGetters;
 
+use crate::layout::inline::has_inline_edge_spacing;
 use crate::net::ResourceHandler;
 use crate::node::NodeFlags;
 use crate::stylo::BlitzNode;
@@ -375,6 +376,13 @@ pub(crate) fn compute_layout_damage(old: &ComputedValues, new: &ComputedValues) 
         }
 
         if old.get_font() != new.get_font() {
+            return true;
+        }
+
+        // Whether a non-atomic inline has edge boxes is decided when its inline layout is built
+        if new_box.display.is_inline_flow()
+            && has_inline_edge_spacing(old) != has_inline_edge_spacing(new)
+        {
             return true;
         }
 
