@@ -352,6 +352,64 @@ pub(crate) fn text_selection_rects(
     rects
 }
 
+/// A highlighted run of text's part on one line of its layout.
+pub(crate) struct HighlightRect {
+    pub(crate) rect: Rect,
+    pub(crate) line: usize,
+    pub(crate) background: Color,
+    pub(crate) color: Option<Color>,
+}
+
+/// The boxes of `highlight` in `layout`: on each line, the selection's extent across its text,
+/// over the content area of the text's font (its ascent above the baseline and its descent below,
+/// rounded to CSS pixels), as Blink bounds a highlighted text fragment, snapped to device pixels.
+pub(crate) fn text_highlight_rects(
+    layout: &Layout<TextBrush>,
+    highlight: &blitz_dom::TextHighlight,
+    scale: f64,
+    snap: crate::pixel_snap::PixelSnap,
+) -> Vec<HighlightRect> {
+    let round_to_css_pixel = |length: f64| (length / scale).round() * scale;
+    let range = &highlight.range;
+    text_selection_rects(layout, range.start, range.end)
+        .into_iter()
+        .filter_map(|(rect, line_index)| {
+            let line = layout.get(line_index)?;
+            let metrics = line.metrics();
+            let font = line
+                .runs()
+                .find(|run| {
+                    let text = run.text_range();
+                    text.start < range.end && text.end > range.start
+                })
+                .map(|run| *run.font_metrics());
+            let baseline = metrics.baseline as f64;
+            let (top, bottom) = match font {
+                Some(font) => (
+                    baseline - round_to_css_pixel(font.ascent as f64),
+                    baseline + round_to_css_pixel(font.descent as f64),
+                ),
+                None => (
+                    metrics.content_block_min_coord as f64,
+                    metrics.content_block_max_coord as f64,
+                ),
+            };
+            let rect = Rect::new(
+                snap.x(rect.x0),
+                snap.y(top),
+                snap.x(rect.x1),
+                snap.y(bottom),
+            );
+            Some(HighlightRect {
+                rect,
+                line: line_index,
+                background: highlight.background,
+                color: highlight.color,
+            })
+        })
+        .collect()
+}
+
 /// Approximates macOS font smoothing (stem dilation). CoreGraphics dilates each side by an amount
 /// in device pixels that grows with the device ppem up to 0.3px (fitted to Safari's ink at 9-72px
 /// and 1x-3x scale), and keeps dilating at large sizes, so there is no ppem cutoff. glifo applies

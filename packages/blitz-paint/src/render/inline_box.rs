@@ -17,7 +17,7 @@ use anyrender::{AntiAliasing, PaintScene};
 use blitz_dom::CopyStyleGetters as _;
 use blitz_dom::node::{InlineBoxRef, InlineEdge, TextBrush, TextLayout};
 use blitz_dom::{BaseDocument, Node, NodeId};
-use kurbo::{Affine, Rect};
+use kurbo::{Affine, Rect, Shape as _};
 use parley::{InlineBoxKind, Line, PositionedLayoutItem};
 use peniko::{BlendMode, Fill};
 use style::computed_values::direction::T as Direction;
@@ -30,6 +30,7 @@ use super::BlitzDomPainter;
 use crate::SELECTION_COLOR;
 use crate::color::{Color, ToColorColor as _};
 use crate::pixel_snap::PixelSnap;
+use crate::text::HighlightRect;
 use crate::text::{RunFilter, TextPaintOptions};
 
 /// The line box fragment of a non-atomic inline element with box decorations.
@@ -402,11 +403,13 @@ fn has_box_decorations(style: &ComputedValues) -> bool {
 
 impl BlitzDomPainter<'_, '_> {
     /// Paints the inline content of `inline_root`, whose text layout is `text_layout`: its inline
-    /// elements' box decorations and its text, with the selection highlight `selection_rects`.
+    /// elements' box decorations and its text, with the selection highlight `selection_rects`
+    /// and the text highlights `highlights`.
     ///
-    /// Each line paints the box decorations of its inline elements, then the selection highlight
-    /// and the text. A line's decorations thus cover the text of the lines before it where they
-    /// overlap, as in browsers. Opacity groups are painted after the rest.
+    /// Each line paints the box decorations of its inline elements, then the text highlights'
+    /// backgrounds, the selection highlight and the text. A line's decorations thus cover the
+    /// text of the lines before it where they overlap, as in browsers. Opacity groups are painted
+    /// after the rest.
     pub(crate) fn draw_inline_content(
         &self,
         scene: &mut impl PaintScene,
@@ -414,6 +417,7 @@ impl BlitzDomPainter<'_, '_> {
         text_layout: &TextLayout,
         transform: Affine,
         selection_rects: &[(Rect, usize)],
+        highlights: &[HighlightRect],
     ) {
         let layout = inline_root.final_layout();
         let containing_block_width = layout.size.width
@@ -433,9 +437,9 @@ impl BlitzDomPainter<'_, '_> {
             containing_block_width,
             boxes: &boxes,
         };
-        self.draw_inline_lines(scene, &lines, None, selection_rects);
+        self.draw_inline_lines(scene, &lines, None, selection_rects, highlights);
         for group in boxes.groups.iter().filter(|group| group.parent.is_none()) {
-            self.draw_opacity_group(scene, &lines, group);
+            self.draw_opacity_group(scene, &lines, group, highlights);
         }
     }
 
@@ -445,6 +449,7 @@ impl BlitzDomPainter<'_, '_> {
         scene: &mut impl PaintScene,
         lines: &InlineLines<'_>,
         group: &OpacityGroup,
+        highlights: &[HighlightRect],
     ) {
         self.layer_manager.maybe_with_layer(
             scene,
@@ -456,22 +461,25 @@ impl BlitzDomPainter<'_, '_> {
             None,
             None,
             |scene| {
-                self.draw_inline_lines(scene, lines, Some(group.node_id), &[]);
+                self.draw_inline_lines(scene, lines, Some(group.node_id), &[], highlights);
                 let nested = lines.boxes.groups.iter();
                 for nested in nested.filter(|nested| nested.parent == Some(group.node_id)) {
-                    self.draw_opacity_group(scene, lines, nested);
+                    self.draw_opacity_group(scene, lines, nested, highlights);
                 }
             },
         );
     }
 
-    /// Paints the lines' fragments and text in the given opacity group (or in none).
+    /// Paints the lines' fragments and text in the given opacity group (or in none). The text
+    /// highlights' backgrounds are painted with the rest, outside any group; their text colours
+    /// in every group.
     fn draw_inline_lines(
         &self,
         scene: &mut impl PaintScene,
         lines: &InlineLines<'_>,
         group: Option<NodeId>,
         selection_rects: &[(Rect, usize)],
+        highlights: &[HighlightRect],
     ) {
         let mut fragments = (lines.boxes.fragments.iter())
             .filter(|fragment| fragment.group == group)
@@ -485,6 +493,19 @@ impl BlitzDomPainter<'_, '_> {
                     lines.containing_block_width,
                 );
             }
+            let on_line = || highlights.iter().filter(|h| h.line == line_index);
+            if group.is_none() {
+                for highlight in on_line() {
+                    scene.fill(
+                        Fill::NonZero,
+                        lines.transform,
+                        highlight.background,
+                        None,
+                        &highlight.rect,
+                        AntiAliasing::Enabled,
+                    );
+                }
+            }
             for (rect, _) in selection_rects.iter().filter(|(_, i)| *i == line_index) {
                 scene.fill(
                     Fill::NonZero,
@@ -495,19 +516,48 @@ impl BlitzDomPainter<'_, '_> {
                     AntiAliasing::Enabled,
                 );
             }
-            crate::text::stroke_text(
-                scene,
-                std::iter::once(line),
-                self.dom,
-                lines.transform,
-                TextPaintOptions {
-                    scale: self.scale,
-                    brush_override: None,
-                    runs: RunFilter::Group(group),
-                },
-                lines.inline_root.id,
-                &mut self.draw_text_context.borrow_mut(),
-            );
+            let stroke = |scene: &mut _, brush_override| {
+                crate::text::stroke_text(
+                    scene,
+                    std::iter::once(line),
+                    self.dom,
+                    lines.transform,
+                    TextPaintOptions {
+                        scale: self.scale,
+                        brush_override,
+                        runs: RunFilter::Group(group),
+                    },
+                    lines.inline_root.id,
+                    &mut self.draw_text_context.borrow_mut(),
+                );
+            };
+            let recolored: Vec<&HighlightRect> = on_line().filter(|h| h.color.is_some()).collect();
+            if recolored.is_empty() {
+                stroke(scene, None);
+                continue;
+            }
+            // Like Blink, the text outside the highlights is painted clipped to outside them,
+            // and the text in each in its colour, clipped to it.
+            let metrics = line.metrics();
+            let reach = f64::from(metrics.line_height.max(1.0));
+            let mut outside = Rect::new(
+                f64::from(metrics.inline_min_coord) - reach,
+                f64::from(metrics.block_min_coord) - reach,
+                f64::from(metrics.inline_max_coord) + reach,
+                f64::from(metrics.block_max_coord) + reach,
+            )
+            .to_path(0.1);
+            for highlight in &recolored {
+                outside.extend(highlight.rect.path_elements(0.1));
+            }
+            scene.push_clip_layer(Fill::EvenOdd, lines.transform, &outside);
+            stroke(scene, None);
+            scene.pop_layer();
+            for highlight in recolored {
+                scene.push_clip_layer(Fill::NonZero, lines.transform, &highlight.rect);
+                stroke(scene, highlight.color);
+                scene.pop_layer();
+            }
         }
     }
 

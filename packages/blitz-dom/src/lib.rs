@@ -102,6 +102,7 @@ pub use mutator::DocumentMutator;
 pub use node::{Attribute, DocumentData, ElementData, Node, NodeData, TextNodeData};
 pub use parley::FontContext;
 pub use scrolling::{ScrollBehavior, ScrollLogicalPosition};
+pub use selection::TextHighlight;
 pub use stylo::UserAgentStylesheet;
 pub use tree::NodeTree;
 

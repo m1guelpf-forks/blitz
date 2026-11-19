@@ -4,7 +4,23 @@
 //! including support for anonymous blocks which have unstable IDs across
 //! layout reconstruction.
 
+use std::ops::Range;
+
 use blitz_traits::node_id::NodeId;
+
+use crate::util::Color;
+
+/// Text painted highlighted, as a browser highlights find-in-page matches: `background` behind
+/// the text's content area, and the text itself in `color` (its own colour when `None`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TextHighlight {
+    /// The inline root whose text this is.
+    pub node: NodeId,
+    /// Byte offsets into the inline root's text.
+    pub range: Range<usize>,
+    pub background: Color,
+    pub color: Option<Color>,
+}
 
 /// Represents one endpoint (anchor or focus) of a text selection.
 ///

@@ -135,6 +135,8 @@ pub struct BlitzDomPainter<'dom, 'a> {
     pub(crate) draw_text_context: RefCell<DrawTextContext>,
     /// Cached selection ranges for O(1) lookup: node_id -> (start_offset, end_offset)
     pub(crate) selection_ranges: HashMap<NodeId, (usize, usize)>,
+    /// The document's highlighted runs of text, by inline root
+    pub(crate) text_highlights: HashMap<NodeId, Vec<&'dom blitz_dom::TextHighlight>>,
 
     // Pre-computed `Scene`s for each CustomWidget
     pub(crate) custom_widget_scenes: &'a CustomWidgetSceneMap,
@@ -156,6 +158,14 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             .into_iter()
             .map(|(node_id, start, end)| (node_id, (start, end)))
             .collect();
+
+        let mut text_highlights: HashMap<NodeId, Vec<&blitz_dom::TextHighlight>> = HashMap::new();
+        for highlight in dom.text_highlights() {
+            text_highlights
+                .entry(highlight.node)
+                .or_default()
+                .push(highlight);
+        }
 
         let layer_manager = LayerManager::default();
         let root_element_id = dom.try_root_element().map(|el| el.id);
@@ -193,6 +203,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             layer_manager,
             draw_text_context: RefCell::new(DrawTextContext::default()),
             selection_ranges,
+            text_highlights,
             custom_widget_scenes,
         }
     }
@@ -1047,7 +1058,30 @@ impl ElementCx<'_, '_> {
                     crate::text::text_selection_rects(&text_layout.layout, start, end)
                 })
                 .unwrap_or_default();
-            self.draw_inline_content(scene, self.node, text_layout, transform, &selection_rects);
+            let snap = crate::pixel_snap::PixelSnap::new(transform, self.scale);
+            let highlights: Vec<crate::text::HighlightRect> = self
+                .context
+                .text_highlights
+                .get(&self.node.id)
+                .into_iter()
+                .flatten()
+                .flat_map(|highlight| {
+                    crate::text::text_highlight_rects(
+                        &text_layout.layout,
+                        highlight,
+                        self.scale,
+                        snap,
+                    )
+                })
+                .collect();
+            self.draw_inline_content(
+                scene,
+                self.node,
+                text_layout,
+                transform,
+                &selection_rects,
+                &highlights,
+            );
         }
     }
 

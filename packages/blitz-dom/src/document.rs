@@ -288,6 +288,8 @@ pub struct BaseDocument {
 
     /// Text selection state (for non-input text)
     pub(crate) text_selection: TextSelection,
+    /// Highlighted runs of text (find-in-page matches), painted under the selection
+    pub(crate) text_highlights: Vec<crate::TextHighlight>,
 
     // TODO: collapse animating state into a bitflags
     /// Whether there are active CSS animations/transitions (so we should re-render every frame)
@@ -525,6 +527,7 @@ impl BaseDocument {
             scrollbar_activity: HashMap::new(),
             scroll_animation: ScrollAnimationState::None,
             text_selection: TextSelection::default(),
+            text_highlights: Vec::new(),
             scratch: DocumentScratch::default(),
         };
 
@@ -2693,6 +2696,18 @@ impl BaseDocument {
     /// Clear the text selection
     pub fn clear_text_selection(&mut self) {
         self.text_selection.clear();
+    }
+
+    /// Set the highlighted runs of text (such as find-in-page matches), replacing any before.
+    /// They refer to inline roots by id, so set them again after a layout that may rebuild
+    /// anonymous blocks.
+    pub fn set_text_highlights(&mut self, highlights: Vec<crate::TextHighlight>) {
+        self.text_highlights = highlights;
+    }
+
+    /// The highlighted runs of text.
+    pub fn text_highlights(&self) -> &[crate::TextHighlight] {
+        &self.text_highlights
     }
 
     /// Update the selection focus point (used during mouse drag to extend selection).
