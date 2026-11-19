@@ -194,6 +194,8 @@ pub(crate) fn build_inline_layout_into(
                                 parley::StyleProperty::TextWrapMode(
                                     stylo_to_parley::text_wrap_mode(s.clone_text_wrap_mode()),
                                 ),
+                                // No box, so no `vertical-align` of its own, nor its parent's.
+                                parley::StyleProperty::VerticalAlign(VerticalAlign::BASELINE),
                             ]
                         });
                         edges.enter_span(builder);
@@ -242,10 +244,14 @@ pub(crate) fn build_inline_layout_into(
                             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                             // TODO: update span id for br spans
                             edges.before_content(builder);
+                            // The line break belongs to the box it's in: it doesn't take that
+                            // box's `vertical-align` again (a table cell's `middle` lifted every
+                            // line ending in a `<br>` by a pixel).
                             builder.push_style_modification_span(&[
                                 parley::StyleProperty::WhiteSpaceCollapse(
                                     WhiteSpaceCollapse::Preserve,
                                 ),
+                                parley::StyleProperty::VerticalAlign(VerticalAlign::BASELINE),
                             ]);
                             builder.push_text("\n");
                             builder.pop_style_span();
