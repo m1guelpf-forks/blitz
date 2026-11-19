@@ -360,7 +360,7 @@ impl BaseDocument {
     }
 
     /// Build ancestor chain from root to node (inclusive), ordered [root, ..., node].
-    fn ancestor_chain_from_root(&self, node_id: NodeId) -> Vec<NodeId> {
+    pub(crate) fn ancestor_chain_from_root(&self, node_id: NodeId) -> Vec<NodeId> {
         let mut ancestors = Vec::with_capacity(16);
         let mut current = Some(node_id);
         while let Some(id) = current {
