@@ -1134,7 +1134,10 @@ impl LayoutPassState<'_> {
 
         // `align-content` aligns the line boxes (as a single unit) within the content box in
         // the block axis. Floats are positioned relative to the formatting context and are not
-        // moved. The offset is stored on the text layout for painting and hit-testing.
+        // moved. The offset is stored on the text layout for painting and hit-testing, by the
+        // final layout only: a measure that runs after it (as a table cell with its own height
+        // is measured, outside the layout cache) mustn't leave its own offset for a cached
+        // final layout to paint with.
         let align_content = BlockContainerStyle::align_content(&self.nodes[node_id].layout_style());
         let block_offset = if align_content.keyword() == taffy::AlignContentKeyword::Normal {
             0.0
@@ -1143,7 +1146,9 @@ impl LayoutPassState<'_> {
                 final_size.height - content_box_inset.vertical_axis_sum() - measured_size.height;
             taffy::compute_block_align_content_offset(align_content, free_space)
         };
-        inline_layout.block_offset = block_offset;
+        if inputs.run_mode == RunMode::PerformLayout {
+            inline_layout.block_offset = block_offset;
+        }
         let line_box_top = container_pb.top + block_offset;
 
         // Store sizes and positions of inline boxes. Walking a line's items builds every
