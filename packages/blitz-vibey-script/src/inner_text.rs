@@ -220,7 +220,7 @@ impl InnerTextCollector {
                         self.visit_inline_box(root, ibox.id, filter);
                     }
                     if range.start >= marker_len
-                        && !layout.is_inline_box_char(range.start)
+                        && !layout.is_generated_char(range.start)
                         && include(&cluster.style().brush)
                     {
                         self.push_str(&text[range]);

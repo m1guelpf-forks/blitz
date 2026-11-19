@@ -2792,7 +2792,7 @@ impl BaseDocument {
             text.push(
                 inline_layout.text[start..end.max(start)]
                     .char_indices()
-                    .filter(|&(i, _)| !inline_layout.is_inline_box_char(start + i))
+                    .filter(|&(i, _)| !inline_layout.is_generated_char(start + i))
                     .map(|(_, c)| c),
             );
             previous = Some(node_id);

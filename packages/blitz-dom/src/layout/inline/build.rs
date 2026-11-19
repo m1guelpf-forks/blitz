@@ -25,7 +25,7 @@ use crate::{
     layout::text_transform::{CaseTransform, TextTransformer, is_collapsible},
     node::{
         EDGE_JOINER, InlineBoxRef, InlineEdge, ListItemLayout, ListItemLayoutPosition, Marker,
-        TextBrush, TextLayout,
+        TextBrush, TextLayout, WORD_BREAK_CHAR_STR,
     },
     stylo_to_parley,
 };
@@ -96,12 +96,14 @@ pub(crate) fn build_inline_layout_into(
     let mut text_transformer = TextTransformer::default();
     text_transformer.word_break(&builder);
     let mut edges = EdgeBoxes::default();
+    let mut word_breaks = Vec::new();
 
     if let Some(before_id) = root_node.before() {
         build_inline_layout_recursive(
             &mut builder,
             &mut text_transformer,
             &mut edges,
+            &mut word_breaks,
             nodes,
             before_id,
             &text_transform,
@@ -112,6 +114,7 @@ pub(crate) fn build_inline_layout_into(
             &mut builder,
             &mut text_transformer,
             &mut edges,
+            &mut word_breaks,
             nodes,
             child_id,
             &text_transform,
@@ -122,6 +125,7 @@ pub(crate) fn build_inline_layout_into(
             &mut builder,
             &mut text_transformer,
             &mut edges,
+            &mut word_breaks,
             nodes,
             after_id,
             &text_transform,
@@ -132,12 +136,14 @@ pub(crate) fn build_inline_layout_into(
         builder.set_line_break_override(Some(NO_BREAK_AT_EDGE_JOINER));
     }
     text_layout.text = builder.build_into(&mut text_layout.layout);
+    text_layout.word_breaks = word_breaks;
     return;
 
     fn build_inline_layout_recursive(
         builder: &mut TreeBuilder<TextBrush>,
         text_transformer: &mut TextTransformer,
         edges: &mut EdgeBoxes,
+        word_breaks: &mut Vec<usize>,
         nodes: &crate::NodeTree,
         node_id: NodeId,
         parent_text_transform: &CaseTransform,
@@ -202,6 +208,7 @@ pub(crate) fn build_inline_layout_into(
                                 builder,
                                 text_transformer,
                                 edges,
+                                word_breaks,
                                 nodes,
                                 child_id,
                                 &text_transform,
@@ -243,6 +250,12 @@ pub(crate) fn build_inline_layout_into(
                             builder.push_text("\n");
                             builder.pop_style_span();
                             text_transformer.word_break(builder);
+                        } else if *tag_name == local_name!("wbr") {
+                            // A line break opportunity, which browsers lay out as a U+200B
+                            // ZERO WIDTH SPACE.
+                            edges.before_content(builder);
+                            builder.push_text(WORD_BREAK_CHAR_STR);
+                            word_breaks.push(builder.text().len() - WORD_BREAK_CHAR_STR.len());
                         } else {
                             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                             let style = node
@@ -267,6 +280,7 @@ pub(crate) fn build_inline_layout_into(
                                     builder,
                                     text_transformer,
                                     edges,
+                                    word_breaks,
                                     nodes,
                                     before_id,
                                     &text_transform,
@@ -278,6 +292,7 @@ pub(crate) fn build_inline_layout_into(
                                     builder,
                                     text_transformer,
                                     edges,
+                                    word_breaks,
                                     nodes,
                                     child_id,
                                     &text_transform,
@@ -288,6 +303,7 @@ pub(crate) fn build_inline_layout_into(
                                     builder,
                                     text_transformer,
                                     edges,
+                                    word_breaks,
                                     nodes,
                                     after_id,
                                     &text_transform,

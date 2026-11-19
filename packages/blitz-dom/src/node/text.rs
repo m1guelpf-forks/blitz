@@ -37,6 +37,8 @@ pub struct TextLayout {
     /// `final_layout`. Paint draws text from the unrounded origin so that it keeps its sub-pixel
     /// position while box edges stay snapped. Set by the `writing-mode` layout pass; zero otherwise.
     pub content_box_subpixel_offset: taffy::Point<f32>,
+    /// Byte indices in `text` of the [`WORD_BREAK_CHAR_STR`]s that stand for `<wbr>` elements.
+    pub word_breaks: Vec<usize>,
 }
 
 impl TextLayout {
@@ -50,10 +52,13 @@ impl TextLayout {
             .get_or_insert_with(|| self.layout.calculate_content_widths())
     }
 
-    /// Whether `byte_index` of `text` is a character that stands in for an inline box rather than
-    /// being part of the document's text: the U+FFFC character of an in-flow inline box, or the
-    /// [`EDGE_JOINER`] that glues an edge box to its element's content.
-    pub fn is_inline_box_char(&self, byte_index: usize) -> bool {
+    /// Whether `byte_index` of `text` is a character that layout put there rather than one of the
+    /// document's text: the U+FFFC character of an in-flow inline box, the [`EDGE_JOINER`] that
+    /// glues an edge box to its element's content, or the [`WORD_BREAK_CHAR_STR`] of a `<wbr>`.
+    pub fn is_generated_char(&self, byte_index: usize) -> bool {
+        if self.word_breaks.binary_search(&byte_index).is_ok() {
+            return true;
+        }
         let rest = self.text.get(byte_index..).unwrap_or_default();
         if rest.starts_with(INLINE_BOX_CHAR) {
             return self
@@ -88,6 +93,10 @@ impl TextLayout {
 
 /// The character Parley places in the text for each in-flow inline box.
 pub const INLINE_BOX_CHAR: char = '\u{FFFC}';
+
+/// The line break opportunity a `<wbr>` puts in the text, U+200B ZERO WIDTH SPACE, as browsers
+/// lay it out.
+pub(crate) const WORD_BREAK_CHAR_STR: &str = "\u{200B}";
 
 /// The character that glues an [edge box](InlineBoxRef::Edge) to its element's content.
 ///
