@@ -297,11 +297,14 @@ pub(crate) fn draw_glyph_run(
         .skew()
         .map(|angle| Affine::skew(angle.to_radians().tan() as f64, 0.0));
 
-    let embolden = if FONT_EMBOLDEN_ENABLED {
+    let mut embolden = if FONT_EMBOLDEN_ENABLED {
         font_embolden(font_size as f64, color, transform)
     } else {
         kurbo::Vec2::default()
     };
+    if run.synthesis().embolden() {
+        embolden += synthetic_bold(font_size as f64);
+    }
 
     let normalized_coords: &[i16] = bytemuck::cast_slice(run.normalized_coords());
     scene.draw_glyphs(
@@ -408,6 +411,16 @@ pub(crate) fn text_highlight_rects(
             })
         })
         .collect()
+}
+
+/// How much a face without a bold is emboldened when bold is asked of it, per side, in the run's
+/// units: Skia's fake bold, which strokes the outline `font_size / 24` wide at 9px, narrowing to
+/// `font_size / 32` at 36px (`kStdFakeBoldInterpKeys`), and leaves advances alone.
+fn synthetic_bold(font_size: f64) -> kurbo::Vec2 {
+    let t = ((font_size - 9.0) / (36.0 - 9.0)).clamp(0.0, 1.0);
+    let ratio = 1.0 / 24.0 + t * (1.0 / 32.0 - 1.0 / 24.0);
+    let per_side = font_size * ratio / 2.0;
+    kurbo::Vec2::new(per_side, per_side)
 }
 
 /// Approximates macOS font smoothing (stem dilation). CoreGraphics dilates each side by an amount
