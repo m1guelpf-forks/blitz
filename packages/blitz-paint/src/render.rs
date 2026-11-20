@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::kurbo_css::CssBox;
+use crate::CustomWidgetSceneMap;
 use crate::blend::convert_blend_mode;
 use crate::color::{Color, ToColorColor};
 use crate::debug_overlay::render_debug_overlay;
@@ -20,7 +21,6 @@ use crate::kurbo_css::NonUniformRoundedRectRadii;
 use crate::layers::LayerManager;
 use crate::sizing::compute_object_fit;
 use crate::text::{DrawTextContext, RunFilter, TextPaintOptions};
-use crate::{CustomWidgetSceneMap, SELECTION_COLOR};
 use anyrender::{AntiAliasing, PaintScene, Scene};
 use blitz_dom::node::{
     ListItemLayout, ListItemLayoutPosition, Marker, NodeData, RasterImageData, TextInputData,
@@ -133,8 +133,9 @@ pub struct BlitzDomPainter<'dom, 'a> {
     pub(crate) layer_manager: LayerManager,
     /// Reusable scratch allocations shared by all text layouts painted for this document.
     pub(crate) draw_text_context: RefCell<DrawTextContext>,
-    /// Cached selection ranges for O(1) lookup: node_id -> (start_offset, end_offset)
-    pub(crate) selection_ranges: HashMap<NodeId, (usize, usize)>,
+    /// Cached selection ranges for O(1) lookup: node_id -> (start_offset, end_offset, whether
+    /// the selection runs on past the node's text)
+    pub(crate) selection_ranges: HashMap<NodeId, (usize, usize, bool)>,
     /// The document's highlighted runs of text, by inline root
     pub(crate) text_highlights: HashMap<NodeId, Vec<&'dom blitz_dom::TextHighlight>>,
 
@@ -153,10 +154,10 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         initial_y: f64,
         custom_widget_scenes: &'a CustomWidgetSceneMap,
     ) -> Self {
-        let selection_ranges: HashMap<NodeId, (usize, usize)> = dom
-            .get_text_selection_ranges()
+        let selection_ranges: HashMap<NodeId, (usize, usize, bool)> = dom
+            .get_text_selection_paint_ranges()
             .into_iter()
-            .map(|(node_id, start, end)| (node_id, (start, end)))
+            .map(|(node_id, start, end, continues)| (node_id, (start, end, continues)))
             .collect();
 
         let mut text_highlights: HashMap<NodeId, Vec<&blitz_dom::TextHighlight>> = HashMap::new();
@@ -1054,8 +1055,13 @@ impl ElementCx<'_, '_> {
                 .context
                 .selection_ranges
                 .get(&self.node.id)
-                .map(|&(start, end)| {
-                    crate::text::text_selection_rects(&text_layout.layout, start, end)
+                .map(|&(start, end, continues)| {
+                    crate::text::text_selection_rects(
+                        &text_layout.layout,
+                        start,
+                        end,
+                        crate::text::LineBreaks::Selected { continues },
+                    )
                 })
                 .unwrap_or_default();
             let snap = crate::pixel_snap::PixelSnap::new(transform, self.scale);
@@ -1116,7 +1122,7 @@ impl ElementCx<'_, '_> {
                     scene.fill(
                         Fill::NonZero,
                         transform,
-                        SELECTION_COLOR,
+                        self.context.dom.text_selection_color(),
                         None,
                         &convert_rect(rect),
                         AntiAliasing::Enabled,

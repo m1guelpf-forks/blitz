@@ -1,7 +1,7 @@
 use anyrender::{AntiAliasing, PaintScene};
 use blitz_dom::{BaseDocument, NodeId, node::TextBrush};
 use kurbo::{Affine, Rect};
-use parley::{Affinity, Cursor, GlyphRun, Layout, Line, PositionedLayoutItem, Selection};
+use parley::{GlyphRun, Layout, Line, PositionedLayoutItem};
 use peniko::Fill;
 use std::sync::Arc;
 
@@ -339,20 +339,105 @@ pub(crate) fn glyph_run_rect(glyph_run: &GlyphRun<'_, TextBrush>) -> Rect {
     Rect::new(x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1))
 }
 
-/// The selection highlight rectangles for the given byte range of a layout, with the index of
-/// the line each is on.
+/// Which line breaks a range of text's highlight paints.
+#[derive(Clone, Copy)]
+pub(crate) enum LineBreaks {
+    /// None: a find-in-page match.
+    None,
+    /// Those of a selection, which runs on past the layout's text when `continues` is set.
+    Selected { continues: bool },
+}
+
+/// The highlight rectangles for the given byte range of a layout, with the index of the line
+/// each is on. As Blink paints a selection (`InlineCursor::CurrentLocalSelectionRectForText`),
+/// a line break the range covers is a box as wide as a space of the line's last font: after a
+/// line's text when the range runs on past it (unless the line ends in a space, which the
+/// range covers instead), and for a `<br>` or a preserved newline.
 pub(crate) fn text_selection_rects(
     layout: &Layout<TextBrush>,
     selection_start: usize,
     selection_end: usize,
+    line_breaks: LineBreaks,
 ) -> Vec<(Rect, usize)> {
-    let anchor = Cursor::from_byte_index(layout, selection_start, Affinity::Downstream);
-    let focus = Cursor::from_byte_index(layout, selection_end, Affinity::Downstream);
+    let range = selection_start..selection_end;
+    let last_line = layout.len().saturating_sub(1);
     let mut rects = Vec::new();
-    Selection::new(anchor, focus).geometry_with(layout, |rect, line_index| {
-        rects.push((Rect::new(rect.x0, rect.y0, rect.x1, rect.y1), line_index));
-    });
+    for (line_index, line) in layout.lines().enumerate() {
+        let text = line.text_range();
+        if text.end <= range.start || text.start >= range.end {
+            continue;
+        }
+        let metrics = line.metrics();
+        let top = f32::min(metrics.block_min_coord, metrics.content_block_min_coord) as f64;
+        let bottom = f32::max(metrics.block_max_coord, metrics.content_block_max_coord) as f64;
+        let mut x = metrics.offset as f64 + metrics.inline_min_coord as f64;
+        let mut start_x = None;
+        // The line's logically last cluster: whether it is a space or a newline, and its run.
+        let mut last: Option<(usize, bool, parley::Run<'_, TextBrush>)> = None;
+        for run in line.runs() {
+            for cluster in run.visual_clusters() {
+                let cluster_text = cluster.text_range();
+                if range.contains(&cluster_text.start) {
+                    start_x.get_or_insert(x);
+                } else if let Some(x0) = start_x.take() {
+                    rects.push((Rect::new(x0, top, x, bottom), line_index));
+                }
+                x += cluster.advance() as f64;
+                if last
+                    .as_ref()
+                    .is_none_or(|(end, ..)| cluster_text.end > *end)
+                {
+                    let ends_line = cluster.is_hard_line_break() || cluster.is_space_or_nbsp();
+                    last = Some((cluster_text.end, ends_line, run));
+                }
+            }
+        }
+        let line_break = match (line_breaks, &last) {
+            (LineBreaks::Selected { continues }, Some((_, false, run)))
+                if !run.is_rtl()
+                    && !matches!(
+                        line.items().last(),
+                        Some(PositionedLayoutItem::InlineBox(_))
+                    )
+                    && (range.end > text.end || continues && line_index == last_line) =>
+            {
+                Some(run)
+            }
+            (LineBreaks::Selected { .. }, Some((end, true, run)))
+                if line.break_reason() == parley::BreakReason::Explicit
+                    && !run.is_rtl()
+                    && range.contains(&(end - 1)) =>
+            {
+                Some(run)
+            }
+            _ => None,
+        };
+        let x1 = x + line_break.map_or(0.0, |run| space_width(run) as f64);
+        if let Some(x0) = start_x.or((x1 > x).then_some(x)) {
+            rects.push((Rect::new(x0, top, x1, bottom), line_index));
+        }
+    }
     rects
+}
+
+/// The advance of a space in a run's font, which Blink paints a selected line break as wide
+/// as (`Font::SpaceWidth`).
+fn space_width(run: &parley::Run<'_, TextBrush>) -> f32 {
+    use skrifa::MetadataProvider as _;
+    use skrifa::instance::{LocationRef, Size};
+    let font = run.font();
+    let Ok(font_ref) = skrifa::FontRef::from_index(font.data.as_ref(), font.index) else {
+        return 0.0;
+    };
+    let Some(space) = font_ref.charmap().map(' ') else {
+        return 0.0;
+    };
+    let coords: &[skrifa::instance::NormalizedCoord] =
+        bytemuck::cast_slice(run.normalized_coords());
+    font_ref
+        .glyph_metrics(Size::new(run.font_size()), LocationRef::new(coords))
+        .advance_width(space)
+        .unwrap_or(0.0)
 }
 
 /// A highlighted run of text's part on one line of its layout.
@@ -374,7 +459,7 @@ pub(crate) fn text_highlight_rects(
 ) -> Vec<HighlightRect> {
     let round_to_css_pixel = |length: f64| (length / scale).round() * scale;
     let range = &highlight.range;
-    text_selection_rects(layout, range.start, range.end)
+    text_selection_rects(layout, range.start, range.end, LineBreaks::None)
         .into_iter()
         .filter_map(|(rect, line_index)| {
             let line = layout.get(line_index)?;

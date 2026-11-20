@@ -27,7 +27,6 @@ use style::properties::ComputedValues;
 use style::values::generics::image::GenericImage;
 
 use super::BlitzDomPainter;
-use crate::SELECTION_COLOR;
 use crate::color::{Color, ToColorColor as _};
 use crate::pixel_snap::PixelSnap;
 use crate::text::HighlightRect;
@@ -510,7 +509,7 @@ impl BlitzDomPainter<'_, '_> {
                 scene.fill(
                     Fill::NonZero,
                     lines.transform,
-                    SELECTION_COLOR,
+                    self.dom.text_selection_color(),
                     None,
                     rect,
                     AntiAliasing::Enabled,

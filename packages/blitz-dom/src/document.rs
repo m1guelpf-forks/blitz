@@ -290,6 +290,8 @@ pub struct BaseDocument {
     pub(crate) text_selection: TextSelection,
     /// Highlighted runs of text (find-in-page matches), painted under the selection
     pub(crate) text_highlights: Vec<crate::TextHighlight>,
+    /// The background of selected text (a browser's `::selection` colour)
+    pub(crate) text_selection_color: crate::util::Color,
 
     // TODO: collapse animating state into a bitflags
     /// Whether there are active CSS animations/transitions (so we should re-render every frame)
@@ -528,6 +530,7 @@ impl BaseDocument {
             scroll_animation: ScrollAnimationState::None,
             text_selection: TextSelection::default(),
             text_highlights: Vec::new(),
+            text_selection_color: crate::util::Color::from_rgb8(180, 213, 255),
             scratch: DocumentScratch::default(),
         };
 
@@ -2710,6 +2713,16 @@ impl BaseDocument {
         &self.text_highlights
     }
 
+    /// Set the background selected text is painted on.
+    pub fn set_text_selection_color(&mut self, color: crate::util::Color) {
+        self.text_selection_color = color;
+    }
+
+    /// The background selected text is painted on.
+    pub fn text_selection_color(&self) -> crate::util::Color {
+        self.text_selection_color
+    }
+
     /// Update the selection focus point (used during mouse drag to extend selection).
     pub fn update_selection_focus(&mut self, focus_node: NodeId, focus_offset: usize) {
         // For anonymous blocks, store parent+sibling_index; otherwise store node directly
@@ -2803,6 +2816,17 @@ impl BaseDocument {
     /// Get all selection ranges as Vec<(node_id, start_offset, end_offset)>.
     /// Returns empty vec if no selection.
     pub fn get_text_selection_ranges(&self) -> Vec<(NodeId, usize, usize)> {
+        self.get_text_selection_paint_ranges()
+            .into_iter()
+            .map(|(node_id, start, end, _)| (node_id, start, end))
+            .collect()
+    }
+
+    /// The selection's range in each inline root it covers, as [`Self::get_text_selection_ranges`],
+    /// with whether it runs on into a later root's text, which selects the root's last line
+    /// break. A selection ending at the start of a root's text doesn't run on into it, as Blink
+    /// paints it.
+    pub fn get_text_selection_paint_ranges(&self) -> Vec<(NodeId, usize, usize, bool)> {
         let Some((first, last, roots)) = self.text_selection_extent() else {
             return Vec::new();
         };
@@ -2819,8 +2843,11 @@ impl BaseDocument {
             let start = if node_id == first.0 { first.1 } else { 0 };
             let end = if node_id == last.0 { last.1 } else { text_len };
             if start < end && end <= text_len {
-                ranges.push((node_id, start, end));
+                ranges.push((node_id, start, end, true));
             }
+        }
+        if let Some(last) = ranges.last_mut() {
+            last.3 = false;
         }
         ranges
     }
