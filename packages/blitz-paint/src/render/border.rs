@@ -57,6 +57,16 @@ fn beveled_edge_color(color: Color, edge: Edge, inset: bool) -> Color {
     let should_darken = top_or_left == inset;
 
     let dark_color = darken(color);
+    // Black doesn't darken, so Blink bevels it between two lightened greys, #545454 on the
+    // darker edges and #a8a8a8 on the lighter ones (as a `<table border>` shows).
+    if dark_color == color {
+        let dark_color = lighten(color);
+        return if should_darken {
+            dark_color
+        } else {
+            lighten(dark_color)
+        };
+    }
     if should_darken {
         return dark_color;
     }

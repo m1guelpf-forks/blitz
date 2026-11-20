@@ -50,6 +50,11 @@ fn parse_pixels(value: &str) -> Option<u32> {
     style::servo::attr::parse_unsigned_integer(value.chars()).ok()
 }
 
+/// A table's `border` attribute as a width in px: an empty or invalid value is 1px.
+fn table_border_width(value: &str) -> u32 {
+    parse_pixels(value).unwrap_or(1)
+}
+
 /// The declaration block that collects an element's hints.
 struct Hints(PropertyDeclarationBlock);
 
@@ -70,9 +75,9 @@ impl Hints {
 pub(crate) struct PresentationalHints {
     /// The hints for the element itself.
     pub own: Option<ServoArc<Locked<PropertyDeclarationBlock>>>,
-    /// For a table, the padding its `cellpadding` attribute gives its cells. Kept on the table
-    /// so that the cells' hints don't depend on their ancestors.
-    pub cell_padding: Option<ServoArc<Locked<PropertyDeclarationBlock>>>,
+    /// For a table, what its `cellpadding` and `border` attributes give its cells. Kept on the
+    /// table so that the cells' hints don't depend on their ancestors.
+    pub cells: Option<ServoArc<Locked<PropertyDeclarationBlock>>>,
 }
 
 /// Push the declaration blocks of the node's presentational hints into `hints`.
@@ -84,14 +89,14 @@ where
         return;
     };
     let element_hints = presentational_hints(node, elem);
-    let cell_padding = if matches_tag!(&elem.name.local, "td" | "th") {
+    let cell_hints = if matches_tag!(&elem.name.local, "td" | "th") {
         table_of_cell(node)
             .and_then(|table| Some(presentational_hints(table, table.data.downcast_element()?)))
-            .and_then(|table| table.cell_padding.as_ref())
+            .and_then(|table| table.cells.as_ref())
     } else {
         None
     };
-    for block in [element_hints.own.as_ref(), cell_padding]
+    for block in [element_hints.own.as_ref(), cell_hints]
         .into_iter()
         .flatten()
     {
@@ -556,6 +561,22 @@ fn compute_presentational_hints(node: &Node, elem: &ElementData) -> Presentation
         // border-style of `none`. It is only these three elements:
         // `embed`, `iframe`, `marquee` and non-image `input` all have a
         // `border` attribute that must stay unmapped.
+        // A table's `border` is its border width, an empty or invalid value 1px, and an
+        // `outset` style unless `frame` sets the styles (Blink's `HTMLTableElement`). Its cells
+        // get theirs below.
+        if *name == local_name!("border") && *tag == local_name!("table") {
+            use style::values::specified::BorderStyle;
+            let width = table_border_width(value);
+            hints.extend(apply_to_all!(BorderSideWidth::from_px(width as f32) =>
+                BorderTopWidth, BorderRightWidth, BorderBottomWidth, BorderLeftWidth,
+            ));
+            if width > 0 && !elem.has_attr(local_name!("frame")) {
+                hints.extend(apply_to_all!(BorderStyle::Outset =>
+                    BorderTopStyle, BorderRightStyle, BorderBottomStyle, BorderLeftStyle,
+                ));
+            }
+        }
+
         if *name == local_name!("border")
             && (is_image_input || matches_tag!(tag, "img" | "object"))
             && let Some(width) = parse_pixels(value)
@@ -645,22 +666,35 @@ fn compute_presentational_hints(node: &Node, elem: &ElementData) -> Presentation
     };
 
     // A table's `cellpadding` attribute maps to the padding of its cells (not
-    // those of nested tables), as a pixel length.
+    // those of nested tables), as a pixel length, and a nonzero `border` without `rules` to
+    // 1px `inset` borders (Blink's `HTMLTableElement::CreateSharedCellStyle`; `rules` is the
+    // user agent stylesheet's).
     // https://html.spec.whatwg.org/multipage/rendering.html#tables-2
-    let cell_padding = (*tag == local_name!("table"))
-        .then(|| elem.attr(local_name!("cellpadding")))
-        .flatten()
-        .and_then(parse_pixels)
-        .and_then(|padding| {
-            let mut block = Hints(PropertyDeclarationBlock::new());
+    let cells = (*tag == local_name!("table")).then(|| {
+        use style::values::specified::BorderStyle;
+        let mut block = Hints(PropertyDeclarationBlock::new());
+        if let Some(padding) = elem.attr(local_name!("cellpadding")).and_then(parse_pixels) {
             block.extend(apply_to_all!(NonNegative(px(padding as f32)) =>
                 PaddingTop, PaddingRight, PaddingBottom, PaddingLeft,
             ));
-            wrap(block.0)
-        });
+        }
+        if elem
+            .attr(local_name!("border"))
+            .is_some_and(|value| table_border_width(value) > 0)
+            && !elem.has_attr(local_name!("rules"))
+        {
+            block.extend(apply_to_all!(BorderSideWidth::from_px(1.0) =>
+                BorderTopWidth, BorderRightWidth, BorderBottomWidth, BorderLeftWidth,
+            ));
+            block.extend(apply_to_all!(BorderStyle::Inset =>
+                BorderTopStyle, BorderRightStyle, BorderBottomStyle, BorderLeftStyle,
+            ));
+        }
+        block.0
+    });
 
     PresentationalHints {
         own: wrap(hints.0),
-        cell_padding,
+        cells: cells.and_then(wrap),
     }
 }
