@@ -98,6 +98,7 @@ pub(crate) fn stroke_text<'a>(
             let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
                 continue;
             };
+            let run_index = run_records.len();
             let run = glyph_run.run();
             let font = run.font();
             let font_size = run.font_size();
@@ -196,6 +197,7 @@ pub(crate) fn stroke_text<'a>(
                             deco: entry.decoration.clone().unwrap(),
                             min_x: f64::INFINITY,
                             max_x: f64::NEG_INFINITY,
+                            runs: run_index..run_index,
                             own: None,
                             first: None,
                         });
@@ -205,6 +207,7 @@ pub(crate) fn stroke_text<'a>(
                 let acc = &mut deco_boxes[idx];
                 acc.min_x = acc.min_x.min(run_x0);
                 acc.max_x = acc.max_x.max(run_x1);
+                acc.runs.end = run_index + 1;
                 if acc.first.is_none() {
                     acc.first = Some(geometry.clone());
                 }
@@ -243,7 +246,7 @@ pub(crate) fn stroke_text<'a>(
             deco_boxes,
             win_ascent_ratios,
             inline_root_id,
-            line.metrics().baseline,
+            &line,
             None,
         );
     }

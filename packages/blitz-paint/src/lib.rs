@@ -13,6 +13,7 @@ mod layers;
 mod pixel_snap;
 mod render;
 mod sizing;
+mod skip_ink;
 mod text;
 mod text_decorations;
 

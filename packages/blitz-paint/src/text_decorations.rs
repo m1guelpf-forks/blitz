@@ -2,10 +2,11 @@ use anyrender::filters::{Filter, FilterEffect};
 use anyrender::{AntiAliasing, PaintScene};
 use blitz_dom::CopyStyleGetters;
 use blitz_dom::{BaseDocument, NodeId, node::TextBrush, util::ToColorColor};
-use kurbo::{Affine, BezPath, Cap, Circle, Rect, Stroke, Vec2};
+use kurbo::{Affine, BezPath, Cap, Circle, Rect, Shape as _, Stroke, Vec2};
 use parley::Line;
 use peniko::{Fill, Mix};
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 use style::properties::generated::longhands::text_decoration_style::computed_value::T as TextDecorationStyle;
 use style::values::computed::{
@@ -15,6 +16,7 @@ use style::values::generics::text::{GenericTextDecorationInset, GenericTextDecor
 
 use crate::color::{Color, ToColorColor as _};
 use crate::pixel_snap::PixelSnap;
+use crate::skip_ink::{InkGap, ink_gaps};
 use crate::text::{RunRecord, TextPaintOptions, draw_glyph_run, glyph_run_rect, glyph_runs};
 
 /// Per-font-face cache of the OS/2 `usWinAscent / unitsPerEm` ratio, keyed by the font
@@ -252,6 +254,9 @@ pub(crate) struct LineDecoration {
     pub(crate) deco: ResolvedDecoration,
     pub(crate) min_x: f64,
     pub(crate) max_x: f64,
+    /// The line's glyph runs (by index) the box covers, whose ink an underline or overline
+    /// skips.
+    pub(crate) runs: Range<usize>,
     /// Geometry from a run whose innermost node is the decorating box itself.
     pub(crate) own: Option<DecorationRunGeometry>,
     /// Geometry from the first run the box covers (fallback when it has no own text on
@@ -315,6 +320,7 @@ fn draw_decoration_line(
     deco_style: TextDecorationStyle,
     inset_start: f64,
     inset_end: f64,
+    gaps: &[InkGap],
 ) {
     // Inset the line from the box's start/end edges (assumes LTR: start is the left edge).
     // Negative insets extend the line past the text.
@@ -326,6 +332,31 @@ fn draw_decoration_line(
     let y = (baseline - offset + size / 2.0) as f64;
     let size = size as f64;
     let butt_stroke = Stroke::new(size).with_caps(Cap::Butt);
+    // The parts of `[x, x + w]` outside the gaps, for the lines the gaps cut whole.
+    let segments = || {
+        let mut start = x;
+        gaps.iter().map(Some).chain([None]).filter_map(move |gap| {
+            let end = gap.map_or(x + w, |gap| gap.x0.clamp(start, x + w));
+            let segment = (start, end);
+            start = gap.map_or(x + w, |gap| gap.x1.clamp(start, x + w));
+            (segment.1 > segment.0).then_some(segment)
+        })
+    };
+    // Dots, dashes and waves are cut by clipping the gaps' rects out, as Blink does.
+    let clip = !gaps.is_empty()
+        && matches!(
+            deco_style,
+            TextDecorationStyle::Dotted | TextDecorationStyle::Dashed | TextDecorationStyle::Wavy
+        );
+    if clip {
+        let reach = 4.0 * size + scale;
+        let mut path = BezPath::new();
+        path.extend(Rect::new(x - reach, y - reach, x + w + reach, y + reach).path_elements(0.1));
+        for gap in gaps {
+            path.extend(Rect::new(gap.x0, gap.y0, gap.x1, gap.y1).path_elements(0.1));
+        }
+        scene.push_clip_layer(Fill::EvenOdd, transform, &path);
+    }
 
     match deco_style {
         TextDecorationStyle::None => {
@@ -333,24 +364,8 @@ fn draw_decoration_line(
         }
         // `solid`
         TextDecorationStyle::Solid => {
-            let line = kurbo::Line::new((x, y), (x + w, y));
-            scene.stroke(
-                &butt_stroke,
-                transform,
-                brush,
-                None,
-                &line,
-                AntiAliasing::Enabled,
-            );
-        }
-        // Two lines, each `size` thick, separated by a 1px (CSS) gap. This
-        // matches Chrome, where the second line is offset by `thickness + 1px`
-        // and sits further from the text (below for underline, above for
-        // overline).
-        TextDecorationStyle::Double => {
-            let one_css_px = scale;
-            for cy in [y, y + double_dir * (size + one_css_px)] {
-                let line = kurbo::Line::new((x, cy), (x + w, cy));
+            for (x0, x1) in segments() {
+                let line = kurbo::Line::new((x0, y), (x1, y));
                 scene.stroke(
                     &butt_stroke,
                     transform,
@@ -359,6 +374,26 @@ fn draw_decoration_line(
                     &line,
                     AntiAliasing::Enabled,
                 );
+            }
+        }
+        // Two lines, each `size` thick, separated by a 1px (CSS) gap. This
+        // matches Chrome, where the second line is offset by `thickness + 1px`
+        // and sits further from the text (below for underline, above for
+        // overline).
+        TextDecorationStyle::Double => {
+            let one_css_px = scale;
+            for cy in [y, y + double_dir * (size + one_css_px)] {
+                for (x0, x1) in segments() {
+                    let line = kurbo::Line::new((x0, cy), (x1, cy));
+                    scene.stroke(
+                        &butt_stroke,
+                        transform,
+                        brush,
+                        None,
+                        &line,
+                        AntiAliasing::Enabled,
+                    );
+                }
             }
         }
         // Round dots (diameter = line thickness) spaced one dot apart.
@@ -439,6 +474,9 @@ fn draw_decoration_line(
             );
         }
     }
+    if clip {
+        scene.pop_layer();
+    }
 }
 
 /// Paint the decorations accumulated for one line, one line per decorating box.
@@ -454,9 +492,10 @@ pub(crate) fn flush_line_decorations(
     deco_boxes: &[LineDecoration],
     win_ascent_ratios: &mut WinAscentCache,
     inline_root_id: NodeId,
-    line_baseline: f32,
+    line: &Line<'_, TextBrush>,
     shadow: Option<(&ResolvedTextShadow, Rect)>,
 ) {
+    let line_baseline = line.metrics().baseline;
     let TextPaintOptions {
         scale,
         brush_override,
@@ -525,7 +564,28 @@ pub(crate) fn flush_line_decorations(
         // Lines are positioned by their top edge, and drawn from their centre
         let baseline = geom.baseline as f64;
         let snap = PixelSnap::new(transform, scale);
-        let mut draw_line = |top: f64, size: f32, double_dir: f64| {
+        let mut draw_line = |top: f64, size: f32, double_dir: f64, skip_ink: Option<f64>| {
+            // Blink skips ink across the line's bounds before they're snapped: the line, both
+            // lines of a double one.
+            let gaps = skip_ink.map_or_else(Vec::new, |thickness| {
+                let bottom = match deco.style {
+                    TextDecorationStyle::Double => 2.0 * thickness + scale,
+                    TextDecorationStyle::Wavy => 2.0 * size as f64 + thickness,
+                    _ => thickness,
+                };
+                let (y0, y1) = match double_dir < 0.0 && deco.style == TextDecorationStyle::Double {
+                    true => (top + size as f64 - bottom, top + size as f64),
+                    false => (top, top + bottom),
+                };
+                ink_gaps(
+                    line,
+                    acc.runs.clone(),
+                    y0,
+                    y1,
+                    thickness.min(13.0 * scale),
+                    scale,
+                )
+            });
             let top = snap.y(top);
             draw_decoration_line(
                 scene,
@@ -541,6 +601,7 @@ pub(crate) fn flush_line_decorations(
                 deco.style,
                 inset_start,
                 inset_end,
+                &gaps,
             );
         };
 
@@ -575,7 +636,12 @@ pub(crate) fn flush_line_decorations(
             };
 
             // A `double` underline extends downward, away from the text.
-            draw_line(top, painted_thickness(deco.style, thickness, scale), 1.0);
+            draw_line(
+                top,
+                painted_thickness(deco.style, thickness, scale),
+                1.0,
+                Some(thickness * scale),
+            );
         }
         if deco.line.contains(TextDecorationLine::OVERLINE) {
             // Fonts don't provide a dedicated overline metric, so reuse the underline
@@ -597,7 +663,12 @@ pub(crate) fn flush_line_decorations(
                 win_ascent(win_ascent_ratios, &geom.font, geom.font_size).unwrap_or(geom.ascent);
 
             // A `double` overline extends upward, away from the text.
-            draw_line(baseline - ascent as f64 - size as f64, size, -1.0);
+            draw_line(
+                baseline - ascent as f64 - size as f64,
+                size,
+                -1.0,
+                Some(thickness * scale),
+            );
         }
         if deco.line.contains(TextDecorationLine::LINE_THROUGH) {
             let thickness = resolved_thickness(
@@ -614,7 +685,12 @@ pub(crate) fn flush_line_decorations(
             let ascent =
                 win_ascent(win_ascent_ratios, &geom.font, geom.font_size).unwrap_or(geom.ascent);
             let top = baseline - ascent as f64 / 3.0 - thickness * scale / 2.0;
-            draw_line(top, painted_thickness(deco.style, thickness, scale), 1.0);
+            draw_line(
+                top,
+                painted_thickness(deco.style, thickness, scale),
+                1.0,
+                None,
+            );
         }
         if clip.is_some() {
             scene.pop_layer();
@@ -642,7 +718,6 @@ pub(crate) fn draw_line_text_shadows(
     inline_root_id: NodeId,
 ) {
     let line_metrics = line.metrics();
-    let line_baseline = line_metrics.baseline;
     let line_height = (line_metrics.block_max_coord - line_metrics.block_min_coord) as f64;
 
     let mut start = 0;
@@ -721,7 +796,7 @@ pub(crate) fn draw_line_text_shadows(
                     deco_boxes,
                     win_ascent_ratios,
                     inline_root_id,
-                    line_baseline,
+                    line,
                     Some((shadow, deco_clip)),
                 );
             }
