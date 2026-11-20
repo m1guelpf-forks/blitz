@@ -157,6 +157,9 @@ pub struct TableRow {
     /// specified length `height`. Such rows do not receive excess table height when there
     /// are unconstrained rows to receive it instead.
     pub is_constrained: bool,
+    /// Whether the row (or its group) is `visibility: collapse`: it is laid out with no height,
+    /// its cells still sizing the columns.
+    pub is_collapsed: bool,
 }
 
 /// The used width of one border side: border widths are not adjusted for
@@ -260,6 +263,7 @@ pub(crate) fn build_table_context(
 
     let border_collapse = stylo_styles.clone_border_collapse();
     let border_spacing = stylo_styles.clone_border_spacing().0;
+    let mut spacing = (border_spacing.width.px(), border_spacing.height.px());
 
     drop(stylo_styles);
 
@@ -339,6 +343,11 @@ pub(crate) fn build_table_context(
     }
     let num_columns = cursor.num_columns.max(column_sizes.len() as u16);
     column_sizes.resize(num_columns as usize, remaining_column);
+    // A table without columns has no border spacing, as in Blink: it is as big as its borders
+    // and padding.
+    if num_columns == 0 {
+        spacing = (0.0, 0.0);
+    }
     let mut fixed_columns = Vec::new();
     if is_fixed {
         // In the fixed table layout algorithm, percentage column widths resolve against
@@ -347,7 +356,7 @@ pub(crate) fn build_table_context(
         // (from which only the outer border-spacing has been removed via padding). Fold
         // the inner border-spacing into the percentage using `calc(N% - N * spacing)`.
         let spacing_x = match border_collapse {
-            BorderCollapse::Separate => border_spacing.width.px(),
+            BorderCollapse::Separate => spacing.0,
             BorderCollapse::Collapse => 0.0,
         };
         let inner_spacing = spacing_x * num_columns.saturating_sub(1) as f32;
@@ -411,6 +420,12 @@ pub(crate) fn build_table_context(
     style.grid_template_rows = rows
         .iter()
         .map(|row| {
+            if row.is_collapsed {
+                return style_helpers::minmax(
+                    style_helpers::length(0.0),
+                    style_helpers::length(0.0),
+                );
+            }
             let min = match row.height {
                 Some(height) => style_helpers::length(height),
                 None => style_helpers::auto(),
@@ -428,8 +443,7 @@ pub(crate) fn build_table_context(
         BorderCollapse::Separate => {
             // In the separated borders model, `border-spacing` also applies between
             // the table border and the outermost cells, in addition to between cells.
-            let spacing_x = border_spacing.width.px();
-            let spacing_y = border_spacing.height.px();
+            let (spacing_x, spacing_y) = spacing;
             let padding = style.padding.resolve_or_zero(None, resolve_calc_value);
             style.padding = taffy::Rect {
                 left: style_helpers::length(padding.left + spacing_x),
@@ -820,15 +834,22 @@ impl TableBuilder {
         self.row += 1;
         self.cursor.start_row();
 
-        let height = doc.nodes[row_id].primary_styles().and_then(|style| {
+        let style = doc.nodes[row_id].primary_styles();
+        let height = style.as_ref().and_then(|style| {
             let height = stylo_taffy::convert::dimension(style.get_height());
             (height.tag() == taffy::CompactLength::LENGTH_TAG).then(|| height.value())
+        });
+        // `visibility` inherits, so a collapsed row group's rows are collapsed too.
+        let is_collapsed = style.is_some_and(|style| {
+            style.get_inherited_box().visibility
+                == style::properties::longhands::visibility::computed_value::T::Collapse
         });
         self.rows.push(TableRow {
             node_id: row_id,
             group: None,
             height,
             is_constrained: height.is_some(),
+            is_collapsed,
         });
 
         self.collect_owned(doc, row_id, TableLevel::Row);
