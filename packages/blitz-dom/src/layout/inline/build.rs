@@ -3,7 +3,8 @@ use blitz_traits::node_id::NodeId;
 use markup5ever::local_name;
 use parley::{
     CHROMIUM_LINE_BREAK_OVERRIDE, FontContext, InlineBox, InlineBoxKind, LayoutContext,
-    LineBreakContext, LineBreakOverrideFn, TreeBuilder, VerticalAlign, WhiteSpaceCollapse,
+    LineBreakContext, LineBreakOverrideFn, TextWrapMode, TreeBuilder, VerticalAlign,
+    WhiteSpaceCollapse,
 };
 use style::{
     Zero as _,
@@ -262,9 +263,15 @@ pub(crate) fn build_inline_layout_into(
                             text_transformer.word_break(builder);
                         } else if *tag_name == local_name!("wbr") {
                             // A line break opportunity, which browsers lay out as a U+200B
-                            // ZERO WIDTH SPACE.
+                            // ZERO WIDTH SPACE. Chromium breaks there even where the text
+                            // doesn't wrap (`white-space: nowrap`): Parley takes the opportunity
+                            // after a character from that character's style.
                             edges.before_content(builder);
+                            builder.push_style_modification_span(&[
+                                parley::StyleProperty::TextWrapMode(TextWrapMode::Wrap),
+                            ]);
                             builder.push_text(WORD_BREAK_CHAR_STR);
+                            builder.pop_style_span();
                             breaks
                                 .wbr
                                 .push(builder.text().len() - WORD_BREAK_CHAR_STR.len());
