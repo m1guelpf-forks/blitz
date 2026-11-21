@@ -5,6 +5,7 @@ mod clip_path;
 mod form_controls;
 mod inline_box;
 mod mask;
+mod table_border;
 
 use blitz_dom::CopyStyleGetters;
 use std::cell::RefCell;

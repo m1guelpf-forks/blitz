@@ -71,18 +71,6 @@ pub struct TableContext {
     calc_values: Vec<LengthPercentage>,
 }
 
-impl TableContext {
-    /// Whether cell `index` reaches the table's last row, and its last column.
-    pub fn cell_reaches_end(&self, index: usize) -> (bool, bool) {
-        self.cells.get(index).map_or((false, false), |cell| {
-            (
-                usize::from(cell.row + cell.rowspan) >= self.rows.len(),
-                usize::from(cell.column + cell.span) >= self.style.grid_template_columns.len(),
-            )
-        })
-    }
-}
-
 // #[derive(Debug, Clone, Eq, PartialEq)]
 // pub enum TableItemKind {
 //     Row,
@@ -98,9 +86,9 @@ pub struct TableCell {
     /// Index of the column the cell originates in
     pub column: u16,
     /// How many columns the cell spans
-    span: u16,
+    pub span: u16,
     /// How many rows the cell spans
-    rowspan: u16,
+    pub rowspan: u16,
     /// The borders collapsed around the cell, when its table collapses borders
     pub collapsed: Option<CollapsedBorders>,
     /// The cell's percentage `width`, as a fraction, which the auto table layout algorithm

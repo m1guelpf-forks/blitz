@@ -1,7 +1,7 @@
 use anyrender::{AntiAliasing, PaintScene};
 use blitz_dom::CopyStyleGetters;
 use blitz_dom::node::SpecialElementData;
-use kurbo::{BezPath, Cap, Circle, Insets, Join, PathEl, Point, Rect, Shape as _, Stroke, Vec2};
+use kurbo::{BezPath, Cap, Circle, Insets, Join, PathEl, Point, Shape as _, Stroke, Vec2};
 use peniko::{Color, Fill};
 use smallvec::SmallVec;
 use style::{
@@ -9,84 +9,80 @@ use style::{
     values::computed::{BorderStyle, OutlineStyle},
 };
 
-use crate::{
-    color::{ToColorColor as _, contrast_ratio},
-    kurbo_css::Edge,
-    render::ElementCx,
-};
+use crate::{color::ToColorColor as _, kurbo_css::Edge, render::ElementCx};
 
-/// A darker version of a colour (mirrors WebKit/Blink's `Color::Dark`): the
-/// brightest channel is reduced by a fixed amount and the others scaled to match,
-/// preserving hue.
-fn darken(color: Color) -> Color {
-    let [r, g, b, a] = color.components;
-    let v = r.max(g).max(b);
-    if v == 0.0 {
-        return color;
-    }
-    let multiplier = ((v - 0.33) / v).max(0.0);
-    Color::new([r * multiplier, g * multiplier, b * multiplier, a])
+/// A channel scaled to 8 bits by truncating it, as Blink's colour shading does.
+fn quantize(channel: f32) -> f32 {
+    (channel * 256f32.next_down()).trunc() / 255.0
 }
 
-/// A lighter version of a colour (mirrors WebKit/Blink's `Color::Light`): the
-/// brightest channel is increased by a fixed amount and the others scaled to
-/// match, preserving hue.
+/// A darker shade of a colour (Blink's `Color::Dark`): its brightest channel 0.33 lower and the
+/// others scaled with it.
+fn darken(color: Color) -> Color {
+    let [r, g, b, a] = color.components;
+    if [r, g, b, a] == [1.0; 4] {
+        return Color::from_rgb8(171, 171, 171);
+    }
+    let v = r.max(g).max(b);
+    let multiplier = if v == 0.0 {
+        0.0
+    } else {
+        ((v - 0.33) / v).max(0.0)
+    };
+    Color::new([
+        quantize(r * multiplier),
+        quantize(g * multiplier),
+        quantize(b * multiplier),
+        a,
+    ])
+}
+
+/// A lighter shade of a colour (Blink's `Color::Light`): its brightest channel 0.33 higher and
+/// the others scaled with it; black becomes #545454.
 fn lighten(color: Color) -> Color {
     let [r, g, b, a] = color.components;
     let v = r.max(g).max(b);
     if v == 0.0 {
-        // Pure black: WebKit uses a fixed dark grey (0x545454).
-        return Color::new([0.33, 0.33, 0.33, a]);
+        return Color::from_rgba8(84, 84, 84, 255).with_alpha(a);
     }
     let multiplier = (v + 0.33).min(1.0) / v;
-    Color::new([r * multiplier, g * multiplier, b * multiplier, a])
+    Color::new([
+        quantize(r * multiplier),
+        quantize(g * multiplier),
+        quantize(b * multiplier),
+        a,
+    ])
 }
 
-/// The colour of a single edge of an `inset`/`outset` border.
-///
-/// An `outset` border is raised: the top/left edges use the "lighter" shade and
-/// the bottom/right edges the "darker" shade (`inset` is the reverse). The exact
-/// shading matches Chrome's `CalculateInsetOutsetColor`:
-///
-/// * The darker edge is always darkened.
-/// * The lighter edge keeps the base colour unchanged, *except* for colours dark
-///   enough that the darkened edge wouldn't have enough contrast against the base
-///   colour, which are lightened instead so the bevel stays visible.
-fn beveled_edge_color(color: Color, edge: Edge, inset: bool) -> Color {
-    let top_or_left = matches!(edge, Edge::Top | Edge::Left);
-    let should_darken = top_or_left == inset;
-
-    let dark_color = darken(color);
-    // Black doesn't darken, so Blink bevels it between two lightened greys, #545454 on the
-    // darker edges and #a8a8a8 on the lighter ones (as a `<table border>` shows).
-    if dark_color == color {
-        let dark_color = lighten(color);
-        return if should_darken {
-            dark_color
+/// The colour of a side of an `inset` or `outset` border, or of half of a `groove` or `ridge`
+/// one, darker when it's in shadow and lighter when lit (Blink's `CalculateInsetOutsetColor`).
+/// A very light colour stays as it is when lit, and a very dark one lightens on both sides so
+/// the bevel shows.
+pub(super) fn inset_outset_color(shadowed: bool, color: Color) -> Color {
+    /// The luminance of rgb(32, 32, 32), and of rgb(235, 235, 235).
+    const DARK: f32 = 0.014_443_844;
+    const LIGHT: f32 = 0.830_77;
+    let luminance = color.split().0.relative_luminance();
+    if luminance <= DARK {
+        return if shadowed {
+            lighten(color)
         } else {
-            lighten(dark_color)
+            lighten(lighten(color))
         };
     }
-    if should_darken {
-        return dark_color;
-    }
-
-    // Lighter edge. Chrome uses the base colour as-is unless the colour is dark
-    // enough that the darkened edge lacks contrast against it. The red/green
-    // shortcut mirrors Chrome: for those colours the contrast is always
-    // sufficient, so the base colour is used without a contrast check.
-    let [r, g, _, _] = color.components;
-    if r >= 150.0 / 255.0 || g >= 92.0 / 255.0 {
-        return color;
-    }
-
-    // Lighten only when the darkened edge would be too low-contrast to read.
-    const MIN_CONTRAST_RATIO: f32 = 1.75;
-    if contrast_ratio(color, dark_color) < MIN_CONTRAST_RATIO {
-        lighten(color)
-    } else {
+    if shadowed {
+        darken(color)
+    } else if luminance > LIGHT {
         color
+    } else {
+        lighten(color)
     }
+}
+
+/// The colour of a single edge of an `inset`/`outset` border: an `outset` border is raised, its
+/// top and left edges lit and its bottom and right ones in shadow (`inset` is the reverse).
+fn beveled_edge_color(color: Color, edge: Edge, inset: bool) -> Color {
+    inset_outset_color(matches!(edge, Edge::Top | Edge::Left) == inset, color)
 }
 
 /// The (outer half, inner half) colours of a single edge of a `groove`/`ridge`
@@ -291,27 +287,22 @@ impl ElementCx<'_, '_> {
                 BorderStyle::Dotted => self.draw_dotted_border_edge(scene, edge, color),
                 BorderStyle::Dashed => self.draw_dashed_border_edge(scene, edge, color),
 
-                // A double border is two solid lines separated by a gap, splitting
-                // the border width into three equal parts (outer line / gap / inner
+                // A double border is two solid lines separated by a gap, its width split
+                // in three at whole CSS px as Blink splits it (outer line / gap / inner
                 // line). Both lines share a color, so both rings are placed into a
                 // single path.
                 BorderStyle::Double => {
                     // Needs at least 3px (one device pixel per line and per gap) to
                     // render as two lines; thinner borders fall back to a solid
                     // fill, matching browser behaviour.
-                    let path = if self.edge_width(edge) < 3.0 * self.scale {
+                    let width = self.edge_width(edge) / self.scale;
+                    let path = if width < 3.0 {
                         self.frame.border_edge_shape(edge)
                     } else {
-                        let mut path = self
-                            .frame
-                            .border_slice(0.0, 1.0 / 3.0)
-                            .border_edge_shape(edge);
-                        path.extend(
-                            &self
-                                .frame
-                                .border_slice(2.0 / 3.0, 1.0)
-                                .border_edge_shape(edge),
-                        );
+                        let outer = (width / 3.0).round() / width;
+                        let inner = (width * 2.0 / 3.0).round() / width;
+                        let mut path = self.frame.border_slice(0.0, outer).border_edge_shape(edge);
+                        path.extend(&self.frame.border_slice(inner, 1.0).border_edge_shape(edge));
                         path
                     };
                     borders.push((color, path));
@@ -328,6 +319,10 @@ impl ElementCx<'_, '_> {
                 // `groove`/`ridge` split each edge into an outer and an inner half,
                 // each shaded as if it were `inset`/`outset`, producing a carved or
                 // raised ridge.
+                // Too thin to split, they're solid (as Blink draws them).
+                BorderStyle::Groove | BorderStyle::Ridge if self.edge_width(edge) <= self.scale => {
+                    borders.push((color, self.frame.border_edge_shape(edge)));
+                }
                 BorderStyle::Groove | BorderStyle::Ridge => {
                     let ridge = edge_style == BorderStyle::Ridge;
                     let (outer, inner) = grooved_edge_colors(color, edge, ridge);
@@ -562,94 +557,6 @@ impl ElementCx<'_, '_> {
             AntiAliasing::Enabled,
         );
         scene.pop_layer();
-    }
-
-    /// Paints a table's collapsed borders, after its cells: each cell's top and left edges, and
-    /// its bottom and right ones at the table's edges, each a band as wide as the border that won
-    /// there, centred on the edge and reaching across the borders it meets at the corners. A
-    /// `double` border 3px or wider is its outer thirds; any other style is painted solid.
-    pub(crate) fn draw_table_borders(&self, scene: &mut impl PaintScene) {
-        let SpecialElementData::TableRoot(table) = &self.element.special_data else {
-            return;
-        };
-        if table.border_collapse != BorderCollapse::Collapse {
-            return;
-        }
-        let mut paint = |color: Color, rect: Rect| {
-            if color.components[3] == 0.0 || rect.is_zero_area() {
-                return;
-            }
-            scene.fill(
-                Fill::NonZero,
-                self.transform,
-                color,
-                None,
-                &rect.scale_from_origin(self.scale),
-                AntiAliasing::Enabled,
-            );
-        };
-        // A band across `rect`, whose thickness is along x when `vertical`.
-        let mut fill = |border: blitz_dom::CollapsedBorder, rect: Rect, vertical: bool| {
-            let color = border.color.as_srgb_color();
-            let width = border.width as f64;
-            if border.style != BorderStyle::Double || width < 3.0 {
-                return paint(color, rect);
-            }
-            let line = (width / 3.0).round();
-            if vertical {
-                paint(color, Rect::new(rect.x0, rect.y0, rect.x0 + line, rect.y1));
-                paint(color, Rect::new(rect.x1 - line, rect.y0, rect.x1, rect.y1));
-            } else {
-                paint(color, Rect::new(rect.x0, rect.y0, rect.x1, rect.y0 + line));
-                paint(color, Rect::new(rect.x0, rect.y1 - line, rect.x1, rect.y1));
-            }
-        };
-        for (index, cell) in table.cells.iter().enumerate() {
-            let Some(borders) = cell.collapsed else {
-                continue;
-            };
-            let Some(node) = self.context.dom.get_node(cell.node_id) else {
-                continue;
-            };
-            let layout = node.final_layout();
-            let (x0, y0) = (layout.location.x as f64, layout.location.y as f64);
-            let (x1, y1) = (
-                x0 + layout.size.width as f64,
-                y0 + layout.size.height as f64,
-            );
-            let half = |border: blitz_dom::CollapsedBorder| border.width as f64 / 2.0;
-            let (top, right, bottom, left) = (
-                half(borders.top),
-                half(borders.right),
-                half(borders.bottom),
-                half(borders.left),
-            );
-            let (last_row, last_column) = table.cell_reaches_end(index);
-            fill(
-                borders.top,
-                Rect::new(x0 - left, y0 - top, x1 + right, y0 + top),
-                false,
-            );
-            fill(
-                borders.left,
-                Rect::new(x0 - left, y0 - top, x0 + left, y1 + bottom),
-                true,
-            );
-            if last_row {
-                fill(
-                    borders.bottom,
-                    Rect::new(x0 - left, y1 - bottom, x1 + right, y1 + bottom),
-                    false,
-                );
-            }
-            if last_column {
-                fill(
-                    borders.right,
-                    Rect::new(x1 - right, y0 - top, x1 + right, y1 + bottom),
-                    true,
-                );
-            }
-        }
     }
 
     /// ❌ dotted - Defines a dotted border

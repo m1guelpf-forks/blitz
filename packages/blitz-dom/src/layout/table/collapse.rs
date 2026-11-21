@@ -19,8 +19,14 @@ use super::{TableCell, TableRow};
 pub struct CollapsedBorder {
     /// Its width in CSS px (0 when no border won, or a `hidden` one did).
     pub width: f32,
+    /// Its style, `inset` drawn as `ridge` and `outset` as `groove`, as the collapsing model
+    /// draws them (CSS Backgrounds 3 §4.2).
     pub style: BorderStyle,
     pub color: AbsoluteColor,
+    /// Where the box it came from is in the order boxes give their borders (cells in document
+    /// order, then rows, row groups and the table): of two equal borders meeting at a corner,
+    /// the earlier one paints it.
+    pub order: usize,
 }
 
 impl CollapsedBorder {
@@ -28,6 +34,7 @@ impl CollapsedBorder {
         width: 0.0,
         style: BorderStyle::None,
         color: AbsoluteColor::TRANSPARENT_BLACK,
+        order: usize::MAX,
     };
 }
 
@@ -77,9 +84,10 @@ struct Candidate {
     width: f32,
     style: BorderStyle,
     color: AbsoluteColor,
+    order: usize,
 }
 
-fn candidate(style: &ComputedValues, side: Side) -> Candidate {
+fn candidate(style: &ComputedValues, side: Side, order: usize) -> Candidate {
     let border = style.get_border();
     let (width, border_style, color) = match side {
         Side::Top => (
@@ -105,8 +113,13 @@ fn candidate(style: &ComputedValues, side: Side) -> Candidate {
     };
     Candidate {
         width: width.to_f32_px(),
-        style: border_style,
+        style: match border_style {
+            BorderStyle::Inset => BorderStyle::Ridge,
+            BorderStyle::Outset => BorderStyle::Groove,
+            style => style,
+        },
         color: color.resolve_to_absolute(&style.clone_color()),
+        order,
     }
 }
 
@@ -150,6 +163,7 @@ fn winner(candidates: &[Candidate]) -> CollapsedBorder {
             width: winner.width,
             style: winner.style,
             color: winner.color,
+            order: winner.order,
         })
 }
 
@@ -188,7 +202,7 @@ pub(crate) fn collapse(
             let (left, right) = (cell.column, (cell.column + cell.span).min(columns));
             let edge = |side: Side| {
                 let mut candidates = Vec::new();
-                let own = style_of(cell.node_id).map(|style| candidate(&style, side));
+                let own = style_of(cell.node_id).map(|style| candidate(&style, side, index));
                 // The cells across the edge, in grid order.
                 let mut neighbors: Vec<usize> = match side {
                     Side::Top if top > 0 => (left..right).filter_map(|c| at(top - 1, c)).collect(),
@@ -203,7 +217,7 @@ pub(crate) fn collapse(
                 neighbors.retain(|neighbor| *neighbor != index);
                 let neighbors = neighbors.into_iter().filter_map(|neighbor| {
                     style_of(cells[neighbor].node_id)
-                        .map(|style| candidate(&style, side.opposite()))
+                        .map(|style| candidate(&style, side.opposite(), neighbor))
                 });
                 // Of two cells, the top or left one wins a tie.
                 if matches!(side, Side::Top | Side::Left) {
@@ -239,7 +253,11 @@ pub(crate) fn collapse(
                         .get(usize::from(row))
                         .and_then(|row| style_of(row.node_id))
                     {
-                        candidates.push(candidate(&style, row_side));
+                        candidates.push(candidate(
+                            &style,
+                            row_side,
+                            cells.len() + usize::from(row),
+                        ));
                     }
                 }
                 for &(row, row_side) in &row_sides {
@@ -253,7 +271,11 @@ pub(crate) fn collapse(
                         Side::Left | Side::Right => true,
                     };
                     if at_group_edge && let Some(style) = style_of(group) {
-                        candidates.push(candidate(&style, row_side));
+                        // Groups come after the rows, in order of their first rows.
+                        let first = (0..=row).rev().take_while(|&r| group_of(r) == Some(group));
+                        let order =
+                            cells.len() + rows.len() + usize::from(first.last().unwrap_or(row));
+                        candidates.push(candidate(&style, row_side, order));
                     }
                 }
                 // And the table's own, at its edges.
@@ -264,7 +286,7 @@ pub(crate) fn collapse(
                     Side::Right => right == columns,
                 };
                 if outer && let Some(style) = style_of(table_id) {
-                    candidates.push(candidate(&style, side));
+                    candidates.push(candidate(&style, side, cells.len() + 2 * rows.len()));
                 }
                 winner(&candidates)
             };
