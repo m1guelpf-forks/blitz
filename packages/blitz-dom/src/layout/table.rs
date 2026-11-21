@@ -6,8 +6,6 @@ use stylo_taffy::CopyStyleGetters;
 
 use atomic_refcell::AtomicRefCell;
 use markup5ever::local_name;
-use style::properties::style_structs::Border;
-use style::servo_arc::Arc as ServoArc;
 use style::typed_om::NumericBaseType;
 use style::values::computed::calc::CalcPercentageLeaf;
 use style::values::computed::length_percentage::{
@@ -19,7 +17,7 @@ use style::values::generics::Optional;
 use style::values::specified::box_::{DisplayInside, DisplayOutside};
 use style::{
     Atom, computed_values::border_collapse::T as BorderCollapse,
-    computed_values::table_layout::T as TableLayout, values::computed::BorderStyle,
+    computed_values::table_layout::T as TableLayout,
 };
 use style_traits::values::specified::AllowedNumericType;
 use taffy::{
@@ -34,9 +32,13 @@ use crate::layout::LayoutPassState;
 use crate::node::NodeKind;
 
 use super::construct::{AnonymousBox, create_anonymous_box};
+
+mod collapse;
+
 use super::damage::{CONSTRUCT_BOX, CONSTRUCT_DESCENDENT, CONSTRUCT_FC};
 use super::replaced::is_replaced_element;
 use super::resolve_calc_value;
+pub use collapse::{CollapsedBorder, CollapsedBorders};
 
 pub struct TableTreeWrapper<'a, 'doc> {
     pub(crate) doc: &'a mut LayoutPassState<'doc>,
@@ -58,7 +60,6 @@ pub struct TableContext {
     /// The table's captions, in document order.
     pub captions: Vec<TableCaption>,
     pub computed_grid_info: AtomicRefCell<Option<DetailedGridInfo<Atom>>>,
-    pub border_style: Option<ServoArc<Border>>,
     pub border_collapse: BorderCollapse,
     /// Whether the table uses the fixed table layout algorithm.
     pub is_fixed: bool,
@@ -68,6 +69,18 @@ pub struct TableContext {
     /// Taffy stores calc values as raw pointers, so these must outlive the `style`.
     #[allow(dead_code)]
     calc_values: Vec<LengthPercentage>,
+}
+
+impl TableContext {
+    /// Whether cell `index` reaches the table's last row, and its last column.
+    pub fn cell_reaches_end(&self, index: usize) -> (bool, bool) {
+        self.cells.get(index).map_or((false, false), |cell| {
+            (
+                usize::from(cell.row + cell.rowspan) >= self.rows.len(),
+                usize::from(cell.column + cell.span) >= self.style.grid_template_columns.len(),
+            )
+        })
+    }
 }
 
 // #[derive(Debug, Clone, Eq, PartialEq)]
@@ -86,6 +99,10 @@ pub struct TableCell {
     pub column: u16,
     /// How many columns the cell spans
     span: u16,
+    /// How many rows the cell spans
+    rowspan: u16,
+    /// The borders collapsed around the cell, when its table collapses borders
+    pub collapsed: Option<CollapsedBorders>,
     /// The cell's percentage `width`, as a fraction, which the auto table layout algorithm
     /// gives its column
     percent_width: Option<f32>,
@@ -201,14 +218,6 @@ fn table_taffy_style(style: &ComputedValues, table_wm: WritingMode) -> taffy::St
     stylo_taffy::to_taffy_style_in(style, table_wm)
 }
 
-fn side_width(width: app_units::Au, style: BorderStyle) -> f32 {
-    if style.none_or_hidden() {
-        0.0
-    } else {
-        width.to_f32_px()
-    }
-}
-
 /// Build a `calc(<percent> + <length>)` track sizing function. The calc value is
 /// boxed and stored in `calc_values` so that the raw pointer Taffy holds stays valid.
 fn percent_plus_length(
@@ -306,7 +315,6 @@ pub(crate) fn build_table_context(
         captions: Vec::new(),
         rows: Vec::new(),
         columns: column_sizes,
-        first_cell_border: None,
         percent_columns: Vec::new(),
     };
     // Header row groups are laid out before other rows, and footer row groups after
@@ -333,12 +341,11 @@ pub(crate) fn build_table_context(
     }
     let TableBuilder {
         cursor,
-        cells,
+        mut cells,
         oof_children,
         captions,
         rows,
         columns: mut column_sizes,
-        first_cell_border,
         percent_columns,
         ..
     } = builder;
@@ -472,30 +479,47 @@ pub(crate) fn build_table_context(
                 height: style_helpers::length(spacing_y),
             }
         }
-        BorderCollapse::Collapse => first_cell_border
-            .as_ref()
-            .map(|border| {
-                let x = side_width(border.border_left_width.0, border.border_left_style).max(
-                    side_width(border.border_right_width.0, border.border_right_style),
-                );
-                let y = side_width(border.border_top_width.0, border.border_top_style).max(
-                    side_width(border.border_bottom_width.0, border.border_bottom_style),
-                );
-                taffy::Size {
-                    width: style_helpers::length(x),
-                    height: style_helpers::length(y),
+        // In the collapsed borders model the cells touch, each with half of the borders
+        // between them, and the table has half of the outer ones and no padding.
+        BorderCollapse::Collapse => {
+            let collapsed = collapse::collapse(doc, table_root_node_id, &cells, &rows, num_columns);
+            let mut outer = taffy::Rect {
+                top: 0.0f32,
+                right: 0.0,
+                bottom: 0.0,
+                left: 0.0,
+            };
+            for (cell, borders) in cells.iter_mut().zip(collapsed) {
+                let halves = borders.halves();
+                if cell.row == 0 {
+                    outer.top = outer.top.max(halves.top);
                 }
-            })
-            .unwrap_or(taffy::Size::ZERO.map(style_helpers::length)),
+                if usize::from(cell.row + cell.rowspan) >= rows.len() {
+                    outer.bottom = outer.bottom.max(halves.bottom);
+                }
+                if cell.column == 0 {
+                    outer.left = outer.left.max(halves.left);
+                }
+                if cell.column + cell.span >= num_columns {
+                    outer.right = outer.right.max(halves.right);
+                }
+                cell.style.border = halves.map(style_helpers::length);
+                cell.collapsed = Some(borders);
+                if let Some(element) = doc.nodes[cell.node_id].element_data_mut() {
+                    element.collapsed_border = Some(halves);
+                }
+            }
+            style.border = outer.map(style_helpers::length);
+            style.padding = taffy::Rect::ZERO.map(style_helpers::length);
+            taffy::Size::ZERO.map(style_helpers::length)
+        }
     };
-
-    if border_collapse == BorderCollapse::Collapse {
-        style.border = taffy::Rect {
-            left: style.gap.width,
-            right: style.gap.width,
-            top: style.gap.height,
-            bottom: style.gap.height,
-        };
+    if border_collapse == BorderCollapse::Separate {
+        for cell in &cells {
+            if let Some(element) = doc.nodes[cell.node_id].element_data_mut() {
+                element.collapsed_border = None;
+            }
+        }
     }
 
     let layout_children = captions
@@ -519,7 +543,6 @@ pub(crate) fn build_table_context(
             border_collapse,
             is_fixed,
             fixed_columns,
-            border_style: first_cell_border,
             calc_values,
         },
         layout_children,
@@ -722,7 +745,6 @@ struct TableBuilder {
     captions: Vec<TableCaption>,
     rows: Vec<TableRow>,
     columns: Vec<TrackSizingFunction>,
-    first_cell_border: Option<ServoArc<Border>>,
     /// Percentage widths set on first-row cells: (column index, percentage, padding + border)
     percent_columns: Vec<(u16, f32, f32)>,
 }
@@ -904,14 +926,10 @@ impl TableBuilder {
         let mut style = table_taffy_style(stylo_style, self.wm);
         let col = self.cursor.next_free();
 
-        // In the collapsed borders model the borders are laid out as gutters between
-        // the cells (see the table's `gap`) rather than as part of the cells
+        // In the collapsed borders model the cell's borders are its share of the borders
+        // collapsed around it, which `build_table_context` sets once every cell is known
         if self.border_collapse == BorderCollapse::Collapse {
             style.border = taffy::Rect::ZERO.map(style_helpers::length);
-        }
-
-        if self.first_cell_border.is_none() {
-            self.first_cell_border = Some(stylo_style.clone_border());
         }
 
         // In the fixed table layout algorithm the widths of columns are not
@@ -1025,6 +1043,8 @@ impl TableBuilder {
             row: self.row.saturating_sub(1),
             column: col,
             span: colspan.max(1),
+            rowspan,
+            collapsed: None,
             percent_width,
             has_length_width,
             has_length_height,

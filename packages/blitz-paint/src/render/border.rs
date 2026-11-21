@@ -12,7 +12,7 @@ use style::{
 use crate::{
     color::{ToColorColor as _, contrast_ratio},
     kurbo_css::Edge,
-    render::{ElementCx, PhysicalTracks},
+    render::ElementCx,
 };
 
 /// A darker version of a colour (mirrors WebKit/Blink's `Color::Dark`): the
@@ -158,6 +158,15 @@ fn sample_points_along_path(path: &BezPath, spacing: f64, count: usize) -> Vec<P
 impl ElementCx<'_, '_> {
     /// Draw all borders for a node
     pub(crate) fn draw_border(&self, scene: &mut impl PaintScene) {
+        // A table that collapses borders paints them for itself and its cells
+        // (`draw_table_borders`).
+        let collapsed_table = matches!(
+            &self.element.special_data,
+            SpecialElementData::TableRoot(table) if table.border_collapse == BorderCollapse::Collapse
+        );
+        if collapsed_table || self.element.collapsed_border.is_some() {
+            return;
+        }
         let style = &*self.style;
         let border = style.get_border();
         let current_color = style.clone_color();
@@ -555,88 +564,90 @@ impl ElementCx<'_, '_> {
         scene.pop_layer();
     }
 
+    /// Paints a table's collapsed borders, after its cells: each cell's top and left edges, and
+    /// its bottom and right ones at the table's edges, each a band as wide as the border that won
+    /// there, centred on the edge and reaching across the borders it meets at the corners. A
+    /// `double` border 3px or wider is its outer thirds; any other style is painted solid.
     pub(crate) fn draw_table_borders(&self, scene: &mut impl PaintScene) {
         let SpecialElementData::TableRoot(table) = &self.element.special_data else {
             return;
         };
-        // Borders are only handled at the table level when BorderCollapse::Collapse
         if table.border_collapse != BorderCollapse::Collapse {
             return;
         }
-
-        let Some(grid_info) = &mut *table.computed_grid_info.borrow_mut() else {
-            return;
-        };
-        let Some(border_style) = table.border_style.as_deref() else {
-            return;
-        };
-
-        let outer_border_style = self.style.get_border();
-
-        let cols = PhysicalTracks::from_tracks(&grid_info.columns);
-        let rows = PhysicalTracks::from_tracks(&grid_info.rows);
-
-        // TODO: support different colors for different borders
-        let current_color = self.style.clone_color();
-        let border_color = border_style
-            .border_top_color
-            .resolve_to_absolute(&current_color)
-            .as_srgb_color();
-
-        // No need to draw transparent borders (as they won't be visible anyway)
-        if border_color == Color::TRANSPARENT {
-            return;
-        }
-
-        // Border widths are not adjusted for border-style in computed styles,
-        // so a border with `none`/`hidden` style must be treated as zero-width.
-        if border_style.border_top_style.none_or_hidden() {
-            return;
-        }
-
-        // The borders are laid out as the gutters between the tracks, and as the border
-        // of the table around them. Track positions are relative to the table's border box.
-        let border_width = table.style.gap.map(|gap| gap.into_raw().value() as f64);
-        let left = cols.origin() as f64 - border_width.width;
-        let right = (cols.origin() + cols.span()) as f64 + border_width.width;
-        let top = rows.origin() as f64 - border_width.height;
-        let bottom = (rows.origin() + rows.span()) as f64 + border_width.height;
-
-        let mut fill = |x0: f64, y0: f64, x1: f64, y1: f64| {
-            let shape = Rect::new(x0, y0, x1, y1).scale_from_origin(self.scale);
+        let mut paint = |color: Color, rect: Rect| {
+            if color.components[3] == 0.0 || rect.is_zero_area() {
+                return;
+            }
             scene.fill(
                 Fill::NonZero,
                 self.transform,
-                border_color,
+                color,
                 None,
-                &shape,
+                &rect.scale_from_origin(self.scale),
                 AntiAliasing::Enabled,
             );
         };
-
-        // Horizontal borders: the outer edges, then the gutters between adjacent row tracks.
-        // The vertical borders are drawn between them so that no corner is painted twice.
-        if outer_border_style.border_top_style != BorderStyle::Hidden {
-            fill(left, top, right, top + border_width.height);
-        }
-        if outer_border_style.border_bottom_style != BorderStyle::Hidden {
-            fill(left, bottom - border_width.height, right, bottom);
-        }
-        for (prev, next) in rows.iter().zip(rows.iter().skip(1)) {
-            fill(left, prev.end as f64, right, next.start as f64);
-        }
-
-        // Vertical borders, one segment per row
-        for row in rows.iter() {
-            let (y0, y1) = (row.start as f64, row.end as f64);
-            if outer_border_style.border_left_style != BorderStyle::Hidden {
-                fill(left, y0, left + border_width.width, y1);
+        // A band across `rect`, whose thickness is along x when `vertical`.
+        let mut fill = |border: blitz_dom::CollapsedBorder, rect: Rect, vertical: bool| {
+            let color = border.color.as_srgb_color();
+            let width = border.width as f64;
+            if border.style != BorderStyle::Double || width < 3.0 {
+                return paint(color, rect);
             }
-            if outer_border_style.border_right_style != BorderStyle::Hidden {
-                fill(right - border_width.width, y0, right, y1);
+            let line = (width / 3.0).round();
+            if vertical {
+                paint(color, Rect::new(rect.x0, rect.y0, rect.x0 + line, rect.y1));
+                paint(color, Rect::new(rect.x1 - line, rect.y0, rect.x1, rect.y1));
+            } else {
+                paint(color, Rect::new(rect.x0, rect.y0, rect.x1, rect.y0 + line));
+                paint(color, Rect::new(rect.x0, rect.y1 - line, rect.x1, rect.y1));
             }
-            for (prev, next) in cols.iter().zip(cols.iter().skip(1)) {
-                fill(prev.end as f64, y0, next.start as f64, y1);
+        };
+        for (index, cell) in table.cells.iter().enumerate() {
+            let Some(borders) = cell.collapsed else {
+                continue;
+            };
+            let Some(node) = self.context.dom.get_node(cell.node_id) else {
+                continue;
+            };
+            let layout = node.final_layout();
+            let (x0, y0) = (layout.location.x as f64, layout.location.y as f64);
+            let (x1, y1) = (
+                x0 + layout.size.width as f64,
+                y0 + layout.size.height as f64,
+            );
+            let half = |border: blitz_dom::CollapsedBorder| border.width as f64 / 2.0;
+            let (top, right, bottom, left) = (
+                half(borders.top),
+                half(borders.right),
+                half(borders.bottom),
+                half(borders.left),
+            );
+            let (last_row, last_column) = table.cell_reaches_end(index);
+            fill(
+                borders.top,
+                Rect::new(x0 - left, y0 - top, x1 + right, y0 + top),
+                false,
+            );
+            fill(
+                borders.left,
+                Rect::new(x0 - left, y0 - top, x0 + left, y1 + bottom),
+                true,
+            );
+            if last_row {
+                fill(
+                    borders.bottom,
+                    Rect::new(x0 - left, y1 - bottom, x1 + right, y1 + bottom),
+                    false,
+                );
+            }
+            if last_column {
+                fill(
+                    borders.right,
+                    Rect::new(x1 - right, y0 - top, x1 + right, y1 + bottom),
+                    true,
+                );
             }
         }
     }

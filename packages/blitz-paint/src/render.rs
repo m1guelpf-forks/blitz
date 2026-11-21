@@ -56,62 +56,6 @@ use taffy::Layout;
 /// element's own content.
 pub(super) const ALMOST_OPAQUE: f32 = 1.0 - f32::EPSILON;
 
-/// A view of the track positions reported by taffy in physical (left-to-right /
-/// top-to-bottom) order. Taffy reports tracks in logical order, which for RTL grid
-/// containers is physically reversed.
-#[derive(Clone, Copy)]
-pub(crate) struct PhysicalTracks<'a> {
-    positions: &'a [taffy::Line<f32>],
-    reversed: bool,
-}
-
-impl<'a> PhysicalTracks<'a> {
-    pub(crate) fn from_tracks<S: taffy::CheapCloneStr>(
-        tracks: &'a taffy::DetailedGridTracksInfo<S>,
-    ) -> Self {
-        let positions = tracks.positions.as_slice();
-        let reversed = positions
-            .first()
-            .zip(positions.last())
-            .is_some_and(|(first, last)| first.start > last.start);
-        Self {
-            positions,
-            reversed,
-        }
-    }
-
-    fn get(self, index: usize) -> taffy::Line<f32> {
-        if self.reversed {
-            self.positions[self.positions.len() - 1 - index]
-        } else {
-            self.positions[index]
-        }
-    }
-
-    /// Iterate track positions in physical order
-    pub(crate) fn iter(self) -> impl ExactSizeIterator<Item = taffy::Line<f32>> + 'a {
-        (0..self.positions.len()).map(move |index| self.get(index))
-    }
-
-    /// The physical start position of the first track
-    pub(crate) fn origin(self) -> f32 {
-        if self.positions.is_empty() {
-            0.0
-        } else {
-            self.get(0).start
-        }
-    }
-
-    /// Total distance from the start of the first track to the end of the last track
-    pub(crate) fn span(self) -> f32 {
-        if self.positions.is_empty() {
-            0.0
-        } else {
-            self.get(self.positions.len() - 1).end - self.get(0).start
-        }
-    }
-}
-
 /// A short-lived struct which holds a bunch of parameters for rendering a scene so
 /// that we don't have to pass them down as parameters
 pub struct BlitzDomPainter<'dom, 'a> {
@@ -709,7 +653,6 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                             cx.draw_inset_box_shadow(scene);
                         }
                         cx.draw_table_row_backgrounds(scene);
-                        cx.draw_table_borders(scene);
                         if paints_own_box {
                             cx.draw_border(scene);
                         }
@@ -751,6 +694,8 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                                 cx.draw_inline_layout(scene, content_position);
                                 cx.draw_marker(scene, content_position);
                                 cx.draw_children(scene, cx.transform, child_clip_rect);
+                                // A table's collapsed borders go over its cells.
+                                cx.draw_table_borders(scene);
                             },
                         );
 

@@ -58,6 +58,9 @@ pub struct TaffyStyloStyle<T: Deref<Target = ComputedValues>> {
     /// `parent_size.width`, i.e. the containing block's block size.
     #[cfg(feature = "writing-mode")]
     pub percent_basis: Option<f32>,
+    /// Physical border widths that replace the style's: a table cell's share of the borders
+    /// collapsed around it.
+    pub border_override: Option<taffy::Rect<f32>>,
 }
 
 impl<T: Deref<Target = ComputedValues>> TaffyStyloStyle<T> {
@@ -86,6 +89,7 @@ impl<T: Deref<Target = ComputedValues>> TaffyStyloStyle<T> {
             align_axis_is_inline: false,
             #[cfg(feature = "writing-mode")]
             percent_basis: None,
+            border_override: None,
         }
     }
 
@@ -102,6 +106,7 @@ impl<T: Deref<Target = ComputedValues>> TaffyStyloStyle<T> {
             align_axis_is_inline: false,
             #[cfg(feature = "writing-mode")]
             percent_basis: None,
+            border_override: None,
         }
     }
 
@@ -318,6 +323,9 @@ impl<T: Deref<Target = ComputedValues>> taffy::CoreStyle for TaffyStyloStyle<T> 
 
     #[inline]
     fn border(&self) -> taffy::Rect<taffy::LengthPercentage> {
+        if let Some(border) = self.border_override {
+            return self.rect(border.map(taffy::LengthPercentage::length));
+        }
         let border_styles = self.style.get_border();
         self.rect(taffy::Rect {
             left: convert::border(

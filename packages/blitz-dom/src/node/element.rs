@@ -85,6 +85,11 @@ pub struct ElementData {
 
     pub mask_images: ThinVec<Option<ImageResourceData>>,
 
+    /// A table cell's share of the borders collapsed around it (half of each), which it's laid
+    /// out with in place of its own borders, when its table collapses borders. Its table paints
+    /// them.
+    pub collapsed_border: Option<taffy::Rect<f32>>,
+
     /// Parley text layout (elements with inline inner display mode only)
     pub inline_layout_data: Option<Box<TextLayout>>,
 
@@ -301,6 +306,7 @@ impl std::fmt::Debug for ElementData {
             .field("special_data", &self.special_data)
             .field("background_images", &self.background_images)
             .field("mask_images", &self.mask_images)
+            .field("collapsed_border", &self.collapsed_border)
             .field("inline_layout_data", &self.inline_layout_data)
             .field("list_item_data", &self.list_item_data)
             .field("template_contents", &self.template_contents)
@@ -327,6 +333,7 @@ impl Clone for ElementData {
             special_data: self.special_data.clone(),
             background_images: self.background_images.clone(),
             mask_images: self.mask_images.clone(),
+            collapsed_border: self.collapsed_border,
             inline_layout_data: self.inline_layout_data.clone(),
             list_item_data: self.list_item_data.clone(),
             template_contents: self.template_contents,
@@ -447,6 +454,7 @@ impl ElementData {
             template_contents: None,
             background_images: ThinVec::new(),
             mask_images: ThinVec::new(),
+            collapsed_border: None,
 
             stylo_element_data: Default::default(),
             selector_flags: Cell::new(ElementSelectorFlags::empty()),

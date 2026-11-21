@@ -1223,15 +1223,18 @@ impl Node {
         }
 
         #[cfg(feature = "writing-mode")]
-        {
+        let mut style = {
             // Own-layout_wm by default: the node's own algorithm reads its style in its own axes
             let layout_wm = styles.writing_mode;
             stylo_taffy::TaffyStyloStyle::new_in(styles, flags, layout_wm)
-        }
+        };
         #[cfg(not(feature = "writing-mode"))]
-        {
-            stylo_taffy::TaffyStyloStyle::new(styles, flags)
-        }
+        let mut style = stylo_taffy::TaffyStyloStyle::new(styles, flags);
+        style.border_override = self
+            .data
+            .downcast_element()
+            .and_then(|element| element.collapsed_border);
+        style
     }
 
     /// The node's style for Taffy, expressed in the axes of the writing mode `layout_wm` (the writing
