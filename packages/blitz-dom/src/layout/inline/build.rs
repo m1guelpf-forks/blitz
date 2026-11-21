@@ -2,13 +2,14 @@ use app_units::Au;
 use blitz_traits::node_id::NodeId;
 use markup5ever::local_name;
 use parley::{
-    FontContext, InlineBox, InlineBoxKind, LayoutContext, LineBreakContext, LineBreakOverrideFn,
-    TreeBuilder, VerticalAlign, WhiteSpaceCollapse,
+    CHROMIUM_LINE_BREAK_OVERRIDE, FontContext, InlineBox, InlineBoxKind, LayoutContext,
+    LineBreakContext, LineBreakOverrideFn, TreeBuilder, VerticalAlign, WhiteSpaceCollapse,
 };
 use style::{
     Zero as _,
     computed_values::position::T as PositionProperty,
     computed_values::white_space_collapse::T as StyloWhiteSpaceCollapse,
+    computed_values::{line_break::T as LineBreak, word_break::T as WordBreak},
     properties::ComputedValues,
     values::{
         computed::{Display, Float},
@@ -96,14 +97,14 @@ pub(crate) fn build_inline_layout_into(
     let mut text_transformer = TextTransformer::default();
     text_transformer.word_break(&builder);
     let mut edges = EdgeBoxes::default();
-    let mut word_breaks = Vec::new();
+    let mut breaks = Breaks::default();
 
     if let Some(before_id) = root_node.before() {
         build_inline_layout_recursive(
             &mut builder,
             &mut text_transformer,
             &mut edges,
-            &mut word_breaks,
+            &mut breaks,
             nodes,
             before_id,
             &text_transform,
@@ -114,7 +115,7 @@ pub(crate) fn build_inline_layout_into(
             &mut builder,
             &mut text_transformer,
             &mut edges,
-            &mut word_breaks,
+            &mut breaks,
             nodes,
             child_id,
             &text_transform,
@@ -125,25 +126,28 @@ pub(crate) fn build_inline_layout_into(
             &mut builder,
             &mut text_transformer,
             &mut edges,
-            &mut word_breaks,
+            &mut breaks,
             nodes,
             after_id,
             &text_transform,
         );
     }
 
-    if edges.any {
-        builder.set_line_break_override(Some(NO_BREAK_AT_EDGE_JOINER));
-    }
+    builder.set_line_break_override(match (edges.any, breaks.anywhere) {
+        (false, false) => Some(CHROMIUM_LINE_BREAK_OVERRIDE),
+        (true, false) => Some(CHROMIUM_BREAKS_AND_EDGE_JOINER),
+        (true, true) => Some(NO_BREAK_AT_EDGE_JOINER),
+        (false, true) => None,
+    });
     text_layout.text = builder.build_into(&mut text_layout.layout);
-    text_layout.word_breaks = word_breaks;
+    text_layout.word_breaks = breaks.wbr;
     return;
 
     fn build_inline_layout_recursive(
         builder: &mut TreeBuilder<TextBrush>,
         text_transformer: &mut TextTransformer,
         edges: &mut EdgeBoxes,
-        word_breaks: &mut Vec<usize>,
+        breaks: &mut Breaks,
         nodes: &crate::NodeTree,
         node_id: NodeId,
         parent_text_transform: &CaseTransform,
@@ -210,7 +214,7 @@ pub(crate) fn build_inline_layout_into(
                                 builder,
                                 text_transformer,
                                 edges,
-                                word_breaks,
+                                breaks,
                                 nodes,
                                 child_id,
                                 &text_transform,
@@ -261,7 +265,9 @@ pub(crate) fn build_inline_layout_into(
                             // ZERO WIDTH SPACE.
                             edges.before_content(builder);
                             builder.push_text(WORD_BREAK_CHAR_STR);
-                            word_breaks.push(builder.text().len() - WORD_BREAK_CHAR_STR.len());
+                            breaks
+                                .wbr
+                                .push(builder.text().len() - WORD_BREAK_CHAR_STR.len());
                         } else {
                             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                             let style = node
@@ -286,7 +292,7 @@ pub(crate) fn build_inline_layout_into(
                                     builder,
                                     text_transformer,
                                     edges,
-                                    word_breaks,
+                                    breaks,
                                     nodes,
                                     before_id,
                                     &text_transform,
@@ -298,7 +304,7 @@ pub(crate) fn build_inline_layout_into(
                                     builder,
                                     text_transformer,
                                     edges,
-                                    word_breaks,
+                                    breaks,
                                     nodes,
                                     child_id,
                                     &text_transform,
@@ -309,7 +315,7 @@ pub(crate) fn build_inline_layout_into(
                                     builder,
                                     text_transformer,
                                     edges,
-                                    word_breaks,
+                                    breaks,
                                     nodes,
                                     after_id,
                                     &text_transform,
@@ -349,11 +355,19 @@ pub(crate) fn build_inline_layout_into(
                 // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                 // dbg!(&data.content);
 
+                let parent_style = node
+                    .parent
+                    .and_then(|parent_id| nodes[parent_id].primary_styles());
+                if let Some(style) = &parent_style {
+                    let text_style = style.get_inherited_text();
+                    breaks.anywhere |= text_style.word_break == WordBreak::BreakAll
+                        || text_style.line_break == LineBreak::Anywhere;
+                }
                 let text =
                     text_transformer.transform(&data.content, parent_text_transform, builder);
                 edges.push_text(builder, text, || {
-                    node.parent
-                        .and_then(|parent_id| nodes[parent_id].primary_styles())
+                    parent_style
+                        .as_ref()
                         .map_or(StyloWhiteSpaceCollapse::Collapse, |s| {
                             s.clone_white_space_collapse()
                         })
@@ -405,6 +419,25 @@ pub(crate) fn has_inline_edge_spacing(style: &ComputedValues) -> bool {
 /// inline box, so that an [`EDGE_JOINER`] glues edge boxes to their element's content.
 static NO_BREAK_AT_EDGE_JOINER: &LineBreakOverrideFn =
     &|cx: LineBreakContext| (cx.before == EDGE_JOINER || cx.after == EDGE_JOINER).then_some(false);
+
+/// [`NO_BREAK_AT_EDGE_JOINER`], then Chromium's rules for the rest.
+static CHROMIUM_BREAKS_AND_EDGE_JOINER: &LineBreakOverrideFn = &|cx: LineBreakContext| {
+    NO_BREAK_AT_EDGE_JOINER(cx).or_else(|| CHROMIUM_LINE_BREAK_OVERRIDE(cx))
+};
+
+/// The line break opportunities a paragraph's content adds to the ones Parley finds.
+///
+/// Between two ASCII characters, browsers break only where their own tables say: Chromium (as
+/// WebKit) never breaks after a `/` (a path, a URL, a date), where UAX #14 allows it. Parley
+/// has Chromium's table, which applies unless some of the text breaks anywhere
+/// (`word-break: break-all`, `line-break: anywhere`), whose breaks the table would suppress.
+#[derive(Default)]
+struct Breaks {
+    /// Where each `<wbr>` is, in the text.
+    wbr: Vec<usize>,
+    /// Some of the text may break between any two characters.
+    anywhere: bool,
+}
 
 /// Builds the [edge boxes](InlineBoxRef::Edge) of non-atomic inline elements, which reserve the
 /// space of their inline-start and inline-end margin, border and padding.
