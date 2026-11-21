@@ -537,13 +537,16 @@ impl LayoutPassState<'_> {
                         ctx: context,
                         style: None,
                     };
-                    if let Some(width) = table_wrapper.size_columns(inputs) {
+                    let caption_width = table_wrapper.caption_min_width();
+                    if let Some(width) = table_wrapper.size_columns(inputs, caption_width) {
                         return taffy::LayoutOutput::from_outer_size(taffy::Size {
                             width,
                             height: 0.0,
                         });
                     }
                     let mut output = compute_grid_layout(&mut table_wrapper, node_id, inputs);
+                    table_wrapper.fit_cells_to_columns(inputs);
+                    let grid_top = table_wrapper.lay_out_captions(inputs, &mut output);
 
                     // Absolutely positioned children take no part in the table grid. Their
                     // static position is the top-left of the table's content box.
@@ -560,7 +563,7 @@ impl LayoutPassState<'_> {
                             .resolve_or_zero(parent_width, resolve_calc_value);
                         let static_position = taffy::Point {
                             x: padding.left + border.left,
-                            y: padding.top + border.top,
+                            y: grid_top + padding.top + border.top,
                         }
                         .map(|pos| AxisStaticPosition::from_edge(pos, AxisStaticEdge::Start));
                         let in_flow_count = context.cells.len();

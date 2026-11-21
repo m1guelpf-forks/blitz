@@ -232,8 +232,8 @@ pub(crate) fn create_anonymous_box(
 
 /// Whether a box belongs inside a table (a row group, row, cell, column or
 /// column group), so needs an anonymous table around it anywhere else.
-/// Captions are left alone: tables don't lay them out yet. A replaced element
-/// is never a table box (CSS Display 3 §2.4).
+/// Captions are left alone: one outside a table is laid out as a block. A
+/// replaced element is never a table box (CSS Display 3 §2.4).
 fn is_internal_table_box(node: &Node) -> bool {
     node.display_style()
         .is_some_and(|display| display.outside() == DisplayOutside::InternalTable)

@@ -13,6 +13,7 @@ use style::values::computed::calc::CalcPercentageLeaf;
 use style::values::computed::length_percentage::{
     CalcLengthPercentage, CalcNode, ComputedLeaf, Unpacked as UnpackedLengthPercentage,
 };
+use style::values::computed::table::CaptionSide;
 use style::values::computed::{Length, LengthPercentage};
 use style::values::generics::Optional;
 use style::values::specified::box_::{DisplayInside, DisplayOutside};
@@ -22,8 +23,8 @@ use style::{
 };
 use style_traits::values::specified::AllowedNumericType;
 use taffy::{
-    DetailedGridInfo, LayoutPartialTree as _, MaybeResolve, ResolveOrZero, TrackSizingFunction,
-    style_helpers,
+    CoreStyle as _, DetailedGridInfo, LayoutPartialTree as _, MaybeResolve, ResolveOrZero,
+    TrackSizingFunction, style_helpers,
 };
 
 use thin_vec::ThinVec;
@@ -54,6 +55,8 @@ pub struct TableContext {
     pub oof_children: Vec<(NodeId, taffy::Position)>,
     pub rows: Vec<TableRow>,
     pub columns: Vec<TableColumn>,
+    /// The table's captions, in document order.
+    pub captions: Vec<TableCaption>,
     pub computed_grid_info: AtomicRefCell<Option<DetailedGridInfo<Atom>>>,
     pub border_style: Option<ServoArc<Border>>,
     pub border_collapse: BorderCollapse,
@@ -143,6 +146,17 @@ pub struct TableColumn {
     pub node_id: NodeId,
     /// The column group (if any) that contains the column
     pub group: Option<NodeId>,
+}
+
+/// A `display: table-caption` child of the table. Captions are laid out above the table's grid
+/// (or below it with `caption-side: bottom`) as wide as the table, which they make at least as
+/// wide as their min-content width. The table's own background and borders surround the grid
+/// alone. This is Chromium's table wrapper box, which is the table box itself there.
+#[derive(Debug, Clone)]
+pub struct TableCaption {
+    pub node_id: NodeId,
+    /// The caption sits below the grid (`caption-side: bottom`).
+    pub below: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -289,6 +303,7 @@ pub(crate) fn build_table_context(
         cursor: ColumnCursor::default(),
         cells: Vec::new(),
         oof_children: Vec::new(),
+        captions: Vec::new(),
         rows: Vec::new(),
         columns: column_sizes,
         first_cell_border: None,
@@ -320,6 +335,7 @@ pub(crate) fn build_table_context(
         cursor,
         cells,
         oof_children,
+        captions,
         rows,
         columns: mut column_sizes,
         first_cell_border,
@@ -482,9 +498,10 @@ pub(crate) fn build_table_context(
         };
     }
 
-    let layout_children = cells
+    let layout_children = captions
         .iter()
-        .map(|cell| cell.node_id)
+        .map(|caption| caption.node_id)
+        .chain(cells.iter().map(|cell| cell.node_id))
         .chain(oof_children.iter().map(|(node_id, _)| *node_id))
         .collect();
     let root_node = &mut doc.nodes[table_root_node_id];
@@ -497,6 +514,7 @@ pub(crate) fn build_table_context(
             oof_children,
             rows,
             columns,
+            captions,
             computed_grid_info: AtomicRefCell::new(None),
             border_collapse,
             is_fixed,
@@ -599,8 +617,9 @@ enum TablePart {
     RowGroup(RowGroupOrder),
     Row,
     Cell,
-    /// Columns, which `collect_columns` handles, and captions, which aren't laid out yet.
+    /// Columns, which `collect_columns` handles.
     Ignored,
+    Caption,
     /// Anything else (a block, inline content, a nested table...), which belongs in a cell.
     Other,
 }
@@ -628,7 +647,11 @@ impl TableLevel {
         match self {
             Self::Table => matches!(
                 part,
-                TablePart::RowGroup(_) | TablePart::Row | TablePart::Ignored | TablePart::Contents
+                TablePart::RowGroup(_)
+                    | TablePart::Row
+                    | TablePart::Ignored
+                    | TablePart::Caption
+                    | TablePart::Contents
             ),
             Self::RowGroup => matches!(part, TablePart::Row | TablePart::Contents),
             Self::Row => matches!(part, TablePart::Cell | TablePart::Contents),
@@ -675,7 +698,7 @@ fn table_part(doc: &BaseDocument, node_id: NodeId) -> TablePart {
         DisplayInside::TableRow => TablePart::Row,
         DisplayInside::TableCell => TablePart::Cell,
         DisplayInside::TableColumn | DisplayInside::TableColumnGroup => TablePart::Ignored,
-        _ if display.outside() == DisplayOutside::TableCaption => TablePart::Ignored,
+        _ if display.outside() == DisplayOutside::TableCaption => TablePart::Caption,
         _ => TablePart::Other,
     }
 }
@@ -696,6 +719,7 @@ struct TableBuilder {
     cursor: ColumnCursor,
     cells: Vec<TableCell>,
     oof_children: Vec<(NodeId, taffy::Position)>,
+    captions: Vec<TableCaption>,
     rows: Vec<TableRow>,
     columns: Vec<TrackSizingFunction>,
     first_cell_border: Option<ServoArc<Border>>,
@@ -766,6 +790,16 @@ impl TableBuilder {
                 (TablePart::Ignored, TableLevel::Table) => {
                     self.wrap(doc, parent_id, level, &mut run, owned);
                     remove_construct_damage(doc, child_id);
+                }
+                (TablePart::Caption, TableLevel::Table) => {
+                    self.wrap(doc, parent_id, level, &mut run, owned);
+                    let below = doc.nodes[child_id].primary_styles().is_some_and(|style| {
+                        style.get_inherited_table().caption_side == CaptionSide::Bottom
+                    });
+                    self.captions.push(TableCaption {
+                        node_id: child_id,
+                        below,
+                    });
                 }
                 (TablePart::Row, TableLevel::Table | TableLevel::RowGroup) => {
                     self.wrap(doc, parent_id, level, &mut run, owned);
@@ -1352,7 +1386,14 @@ impl TableTreeWrapper<'_, '_> {
     /// doesn't resolve, browsers size it from its columns' lengths alone and give it a huge
     /// max-content width ([`TABLE_MAX_WIDTH`]), so that it fills whatever the percentage then
     /// resolves against.
-    pub(crate) fn size_columns(&mut self, inputs: taffy::tree::LayoutInput) -> Option<f32> {
+    ///
+    /// Either way the table is never narrower than `floor`, its captions' widest min-content
+    /// width ([`Self::caption_min_width`]).
+    pub(crate) fn size_columns(
+        &mut self,
+        inputs: taffy::tree::LayoutInput,
+        floor: f32,
+    ) -> Option<f32> {
         self.style = None;
         let ctx = Arc::clone(&self.ctx);
         let style = &ctx.style;
@@ -1380,6 +1421,7 @@ impl TableTreeWrapper<'_, '_> {
                 .sum::<f32>()
                 + sizes.edges
                 + sizes.gaps;
+            let lengths = lengths.max(floor);
             // Without a width, the table's percentage width doesn't resolve: it's being measured
             let width = match (sizes.specified, space) {
                 (Some(width), _) => width,
@@ -1400,7 +1442,7 @@ impl TableTreeWrapper<'_, '_> {
             let sum = |of: fn(&ColumnWidths) -> f32| {
                 columns.iter().map(of).sum::<f32>() + sizes.edges + sizes.gaps
             };
-            let min = sum(|column| column.min);
+            let min = sum(|column| column.min).max(floor);
             let width = match (sizes.specified, space) {
                 (Some(width), _) => width,
                 (None, taffy::AvailableSpace::Definite(available)) => {
@@ -1430,6 +1472,222 @@ impl TableTreeWrapper<'_, '_> {
         style.max_size.width = style_helpers::auto();
         self.style = Some(style);
         None
+    }
+
+    /// Narrows the cells that are wider than their columns to those columns, after a full layout
+    /// of the grid. A grid item is never narrower than its padding and borders, but a table cell
+    /// is as wide as its columns: in a fixed-layout table whose percentage columns take all its
+    /// width, an `auto` column and its cells are 0 wide, and the cell's content overflows it from
+    /// where its padding puts it (as in Chromium), with no background or borders showing.
+    pub(crate) fn fit_cells_to_columns(&mut self, inputs: taffy::tree::LayoutInput) {
+        if inputs.run_mode != taffy::RunMode::PerformLayout {
+            return;
+        }
+        let ctx = Arc::clone(&self.ctx);
+        let grid = ctx.computed_grid_info.borrow();
+        let Some(columns) = grid.as_ref().map(|grid| &grid.columns.positions) else {
+            return;
+        };
+        for cell in &ctx.cells {
+            let (first, last) = (
+                usize::from(cell.column),
+                usize::from(cell.column + cell.span) - 1,
+            );
+            let (Some(first), Some(last)) = (columns.get(first), columns.get(last)) else {
+                continue;
+            };
+            let width = (last.end - first.start).abs();
+            let layout = self.doc.nodes[cell.node_id].unrounded_layout_mut();
+            if layout.size.width > width {
+                layout.size.width = width;
+                // Borders it has no room for don't paint.
+                if layout.border.left + layout.border.right > width {
+                    (layout.border.left, layout.border.right) = (0.0, 0.0);
+                }
+            }
+        }
+    }
+
+    /// The widest of the captions' min-content widths, margins included: the table is never
+    /// narrower, so a caption's longest word never overflows it.
+    pub(crate) fn caption_min_width(&mut self) -> f32 {
+        let ctx = Arc::clone(&self.ctx);
+        let mut widest: f32 = 0.0;
+        for caption in &ctx.captions {
+            let width = self
+                .doc
+                .compute_child_layout(
+                    crate::taffy_node_id(caption.node_id),
+                    taffy::tree::LayoutInput {
+                        run_mode: taffy::RunMode::ComputeSize,
+                        sizing_mode: taffy::SizingMode::InherentSize,
+                        axis: taffy::RequestedAxis::Horizontal,
+                        known_dimensions: taffy::Size::NONE,
+                        known_dimensions_are_definite: taffy::Size {
+                            width: true,
+                            height: true,
+                        },
+                        parent_size: taffy::Size::NONE,
+                        available_space: taffy::Size {
+                            width: taffy::AvailableSpace::MinContent,
+                            height: taffy::AvailableSpace::MinContent,
+                        },
+                        vertical_margins_are_collapsible: taffy::Line::FALSE,
+                    },
+                )
+                .size
+                .width;
+            let style = self
+                .doc
+                .child_layout_style(&self.doc.nodes[caption.node_id]);
+            let margin = style
+                .margin()
+                .resolve_or_zero(None, resolve_calc_value)
+                .horizontal_axis_sum();
+            widest = widest.max(width + margin);
+        }
+        widest
+    }
+
+    /// Lays the captions out as wide as the table, whose grid's layout is `output`: the
+    /// `caption-side: top` ones above the grid and the others below it, each below the last,
+    /// and makes `output` the whole table's. In a full layout it places them and moves the grid
+    /// (its cells and its rows' tracks) down below the captions above it. Returns how far down
+    /// the grid starts.
+    pub(crate) fn lay_out_captions(
+        &mut self,
+        inputs: taffy::tree::LayoutInput,
+        output: &mut taffy::LayoutOutput,
+    ) -> f32 {
+        let ctx = Arc::clone(&self.ctx);
+        let measuring_width = inputs.run_mode == taffy::RunMode::ComputeSize
+            && inputs.axis == taffy::RequestedAxis::Horizontal;
+        if ctx.captions.is_empty()
+            || measuring_width
+            || inputs.run_mode == taffy::RunMode::PerformHiddenLayout
+        {
+            return 0.0;
+        }
+        let width = output.size.width;
+        let parent = Some(width);
+        // The heights of the captions above the grid and below it, margins included.
+        let mut heights = [0.0f32; 2];
+        let mut placed = Vec::new();
+        for (order, caption) in ctx.captions.iter().enumerate() {
+            let (margin, padding, border, caption_width) = {
+                let style = self
+                    .doc
+                    .child_layout_style(&self.doc.nodes[caption.node_id]);
+                let margin = style.margin().resolve_or_zero(parent, resolve_calc_value);
+                let padding = style.padding().resolve_or_zero(parent, resolve_calc_value);
+                let border = style.border().resolve_or_zero(parent, resolve_calc_value);
+                let edges = (padding + border).horizontal_axis_sum();
+                let box_sizing = match style.box_sizing() {
+                    taffy::BoxSizing::ContentBox => edges,
+                    taffy::BoxSizing::BorderBox => 0.0,
+                };
+                fn resolve(
+                    size: impl MaybeResolve<Option<f32>, Option<f32>>,
+                    parent: Option<f32>,
+                    box_sizing: f32,
+                ) -> Option<f32> {
+                    size.maybe_resolve(parent, resolve_calc_value)
+                        .map(|size| size + box_sizing)
+                }
+                // A block box, which fills the width it's given unless it has one of its own.
+                let mut caption_width = resolve(style.size().width, parent, box_sizing)
+                    .unwrap_or(width - margin.horizontal_axis_sum());
+                if let Some(max) = resolve(style.max_size().width, parent, box_sizing) {
+                    caption_width = caption_width.min(max);
+                }
+                if let Some(min) = resolve(style.min_size().width, parent, box_sizing) {
+                    caption_width = caption_width.max(min);
+                }
+                (margin, padding, border, caption_width.max(edges))
+            };
+            let node_id = crate::taffy_node_id(caption.node_id);
+            let laid = self.doc.compute_child_layout(
+                node_id,
+                taffy::tree::LayoutInput {
+                    run_mode: inputs.run_mode,
+                    sizing_mode: taffy::SizingMode::InherentSize,
+                    axis: taffy::RequestedAxis::Both,
+                    known_dimensions: taffy::Size {
+                        width: Some(caption_width),
+                        height: None,
+                    },
+                    known_dimensions_are_definite: taffy::Size {
+                        width: true,
+                        height: true,
+                    },
+                    parent_size: taffy::Size {
+                        width: parent,
+                        height: None,
+                    },
+                    available_space: taffy::Size {
+                        width: taffy::AvailableSpace::Definite(caption_width),
+                        height: taffy::AvailableSpace::MaxContent,
+                    },
+                    vertical_margins_are_collapsible: taffy::Line::FALSE,
+                },
+            );
+            let side = usize::from(caption.below);
+            let top = heights[side] + margin.top;
+            heights[side] = top + laid.size.height + margin.bottom;
+            placed.push((
+                node_id,
+                caption.below,
+                taffy::Layout {
+                    order: order as u32,
+                    location: taffy::Point {
+                        x: margin.left,
+                        y: top,
+                    },
+                    size: laid.size,
+                    scrollable_overflow_rect: laid.scrollable_overflow_rect,
+                    scrollbar_size: taffy::Size::ZERO,
+                    border,
+                    padding,
+                    margin,
+                },
+            ));
+        }
+        let [above, below] = heights;
+        let grid_height = output.size.height;
+        if inputs.run_mode == taffy::RunMode::PerformLayout {
+            for (node_id, caption_below, mut layout) in placed {
+                if caption_below {
+                    layout.location.y += above + grid_height;
+                }
+                self.doc.set_unrounded_layout(node_id, &layout);
+            }
+            if above > 0.0 {
+                for cell in &ctx.cells {
+                    self.doc.nodes[cell.node_id]
+                        .unrounded_layout_mut()
+                        .location
+                        .y += above;
+                }
+                if let Some(grid) = ctx.computed_grid_info.borrow_mut().as_mut() {
+                    for row in &mut grid.rows.positions {
+                        row.start += above;
+                        row.end += above;
+                    }
+                }
+            }
+        }
+        output.size.height += above + below;
+        output.baselines.first = output.baselines.first.map(|baseline| baseline + above);
+        output.baselines.last = output.baselines.last.map(|baseline| baseline + above);
+        let overflow = output.scrollable_overflow_rect.rect();
+        output.scrollable_overflow_rect = taffy::ScrollableOverflow::new(
+            taffy::Rect {
+                bottom: overflow.bottom + above + below,
+                ..overflow
+            },
+            output.scrollable_overflow_rect.is_reversed(),
+        );
+        above
     }
 
     /// Each column's widths: from the `<col>` widths, then from the cells that span only it,

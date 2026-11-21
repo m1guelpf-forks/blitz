@@ -23,8 +23,8 @@ use crate::sizing::compute_object_fit;
 use crate::text::{DrawTextContext, RunFilter, TextPaintOptions};
 use anyrender::{AntiAliasing, PaintScene, Scene};
 use blitz_dom::node::{
-    ListItemLayout, ListItemLayoutPosition, Marker, NodeData, RasterImageData, TextInputData,
-    TextNodeData,
+    ListItemLayout, ListItemLayoutPosition, Marker, NodeData, RasterImageData, SpecialElementData,
+    TextInputData, TextNodeData,
 };
 use blitz_dom::{BaseDocument, ElementData, Node, NodeId, local_name};
 use blitz_traits::devtools::DevtoolSettings;
@@ -821,9 +821,17 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         // todo: maybe cache this so we don't need to constantly be figuring it out
         // It is quite a bit of math to calculate during render/traverse
         // Also! we can cache the bezpaths themselves, saving us a bunch of work
-        let frame = create_css_rect(&style, &layout, scale);
-
         let element = node.element_data().unwrap();
+        let frame = match &element.special_data {
+            SpecialElementData::TableRoot(table) if !table.captions.is_empty() => {
+                let captions = table
+                    .captions
+                    .iter()
+                    .map(|caption| (caption.node_id, caption.below));
+                table_grid_rect(self.dom, captions, &style, layout, scale)
+            }
+            _ => create_css_rect(&style, &layout, scale),
+        };
 
         ElementCx {
             context: self,
@@ -1562,6 +1570,37 @@ fn insets_from_taffy_rect(input: taffy::Rect<f64>) -> Insets {
 }
 
 /// Convert Stylo and Taffy types into Kurbo types
+/// The box a table with captions paints its background, borders, shadows and outline around: its
+/// grid, between the captions above it and those below it.
+fn table_grid_rect(
+    dom: &BaseDocument,
+    captions: impl Iterator<Item = (NodeId, bool)>,
+    style: &ComputedValues,
+    layout: Layout,
+    scale: f64,
+) -> CssBox {
+    let (mut top, mut bottom) = (0.0f32, layout.size.height);
+    for (caption, below) in captions {
+        let Some(caption_layout) = dom.get_node(caption).map(|node| node.final_layout()) else {
+            continue;
+        };
+        if below {
+            bottom = bottom.min(caption_layout.location.y - caption_layout.margin.top);
+        } else {
+            top = top.max(
+                caption_layout.location.y
+                    + caption_layout.size.height
+                    + caption_layout.margin.bottom,
+            );
+        }
+    }
+    let mut grid = layout;
+    grid.size.height = (bottom - top).max(0.0);
+    let mut frame = create_css_rect(style, &grid, scale);
+    frame.border_box = frame.border_box + Vec2::new(0.0, top as f64 * scale);
+    frame
+}
+
 fn create_css_rect(style: &ComputedValues, layout: &Layout, scale: f64) -> CssBox {
     // Resolve and rescale
     // We have to scale since document pixels are not same same as rendered pixels
