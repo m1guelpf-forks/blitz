@@ -366,7 +366,13 @@ fn compute_presentational_hints(node: &Node, elem: &ElementData) -> Presentation
             }
         }
 
-        if *name == local_name!("align") {
+        // A table's `align` places the table, as its margins (`center`) or its float (`left`
+        // and `right`, in default.css), and leaves its content's alignment alone.
+        if *name == local_name!("align") && *tag == local_name!("table") {
+            if value.eq_ignore_ascii_case("center") {
+                hints.extend(apply_to_all!(Margin::Auto => MarginLeft, MarginRight));
+            }
+        } else if *name == local_name!("align") {
             use style::values::specified::TextAlign;
             let keyword = match value {
                 "left" => Some(StyloTextAlign::MozLeft),
